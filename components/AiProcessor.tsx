@@ -1,158 +1,161 @@
-
-import React, { useState, useCallback, useEffect } from 'react';
-import { BrainCircuit, CheckCircle, XCircle, RotateCcw, Search } from 'lucide-react';
-import { useCompleteness } from '../context/CompletenessContext.tsx';
-import { useAiAnalysis } from '../hooks/useAiAnalysis.ts';
-import { ProcessingStatus } from '../types.ts';
-import { getStaticChecklist, COMPLETENESS_FIELD_CHECKLIST } from '../data/rules.ts';
-import { extractTextFromFile } from '../utils/fileReader.ts'; // Although we don't upload here, settings does.
+import React, { useState, useCallback } from "react"
+import { BrainCircuit, CheckCircle, XCircle, RotateCcw, Search } from "lucide-react"
+import { useCompleteness } from "../context/CompletenessContext.tsx"
+import { useAiAnalysis } from "../hooks/useAiAnalysis.ts"
+import { ProcessingStatus } from "../types.ts"
+import { getStaticChecklist, COMPLETENESS_FIELD_CHECKLIST } from "../data/rules.ts"
 
 const AiProcessor: React.FC = () => {
-    const [status, setStatus] = useState<ProcessingStatus>('idle');
-    const [error, setError] = useState<string | null>(null);
-    const [progress, setProgress] = useState({ current: 0, total: 0 });
+    const [status, setStatus] = useState<ProcessingStatus>("idle")
+    const [error, setError] = useState<string | null>(null)
+    const [progress, setProgress] = useState({ current: 0, total: 0 })
 
-    const { 
-        updateFieldContent, 
-        resetCompleteness, 
+    const {
+        updateFieldContent,
+        resetCompleteness,
         generateAllItems,
+        identifiedEntities,
         setIdentifiedEntities,
         canonText,
         execContractText,
         fieldRules,
-        setExtractedContent,
-    } = useCompleteness();
-    const { identifyEntities, generateContentForAllFields, error: analysisError } = useAiAnalysis();
+        pdfExtractionRules,
+    } = useCompleteness()
 
-    useEffect(() => {
-        if (analysisError) {
-            setError(analysisError);
-            setStatus('error');
+    const { identifyEntities, generateContentForAllFields } = useAiAnalysis()
+
+    const contractBundle = `${execContractText}
+
+[PDF EXTRACTION RULES]
+${pdfExtractionRules}
+`.trim()
+
+    const generateAllItemsLocal = useCallback(
+        (entities: { characters: string[]; locations: string[] }) => {
+            let dynamicItems: string[] = []
+            const staticItems = getStaticChecklist(COMPLETENESS_FIELD_CHECKLIST)
+
+            entities.characters.forEach((char) => {
+                const charTemplateL2 = COMPLETENESS_FIELD_CHECKLIST.L2.CHARACTERS.Character
+                if (charTemplateL2) dynamicItems.push(...getStaticChecklist(charTemplateL2, `L2.CHARACTERS.${char}`))
+                const charTemplateL3 = COMPLETENESS_FIELD_CHECKLIST.L3.CHARACTERS.Character
+                if (charTemplateL3) dynamicItems.push(...getStaticChecklist(charTemplateL3, `L3.CHARACTERS.${char}`))
+            })
+
+            entities.locations.forEach((loc) => {
+                const locTemplateL2 = COMPLETENESS_FIELD_CHECKLIST.L2.WORLD.Locations.Location
+                if (locTemplateL2) dynamicItems.push(...getStaticChecklist(locTemplateL2, `L2.WORLD.Locations.${loc}`))
+                const locTemplateL3 = COMPLETENESS_FIELD_CHECKLIST.L3.WORLD.Locations.Location
+                if (locTemplateL3) dynamicItems.push(...getStaticChecklist(locTemplateL3, `L3.WORLD.Locations.${loc}`))
+            })
+
+            generateAllItems(entities as any)
+            return [...staticItems, ...dynamicItems]
+        },
+        [generateAllItems]
+    )
+
+    const handleProcess = useCallback(async () => {
+        setError(null)
+
+        if (!canonText || !canonText.trim()) {
+            setError("Canon is empty. Open Canon and paste/upload a document, then Save.")
+            setStatus("error")
+            return
         }
-    }, [analysisError]);
-
-    const handleProcess = async () => {
-        if (!canonText) {
-            setError("Canon text is empty. Please add content in Settings.");
-            setStatus('error');
-            return;
-        }
-        
-        resetCompleteness();
-        // Set the content for the viewer. Since we only have raw text, format is 'text'.
-        // A more advanced version could re-process the original file if it was a DOCX.
-        setExtractedContent({ content: canonText, format: 'text' });
-
-        setStatus('identifying');
-        setError(null);
-        setProgress({ current: 0, total: 0 });
 
         try {
+            setStatus("identifying")
+            setProgress({ current: 0, total: 0 })
+
             // Stage 1: Identify Entities
-            const entities = await identifyEntities(canonText, execContractText);
-            setIdentifiedEntities(entities);
-            
+            const entities = await identifyEntities(canonText, contractBundle)
+            setIdentifiedEntities(entities)
+
             // Generate the full dynamic checklist
-            generateAllItems(entities);
-            
-            setTimeout(async () => {
-                const staticItems = getStaticChecklist(COMPLETENESS_FIELD_CHECKLIST);
-                let dynamicItems: string[] = [];
-                entities.characters.forEach(char => {
-                    if(COMPLETENESS_FIELD_CHECKLIST.L2.CHARACTERS.Character) dynamicItems.push(...getStaticChecklist(COMPLETENESS_FIELD_CHECKLIST.L2.CHARACTERS.Character, `L2.CHARACTERS.${char}`));
-                    if(COMPLETENESS_FIELD_CHECKLIST.L3.CHARACTERS.Character) dynamicItems.push(...getStaticChecklist(COMPLETENESS_FIELD_CHECKLIST.L3.CHARACTERS.Character, `L3.CHARACTERS.${char}`));
-                });
-                entities.locations.forEach(loc => {
-                    if(COMPLETENESS_FIELD_CHECKLIST.L2.WORLD.Locations.Location) dynamicItems.push(...getStaticChecklist(COMPLETENESS_FIELD_CHECKLIST.L2.WORLD.Locations.Location, `L2.WORLD.Locations.${loc}`));
-                    if(COMPLETENESS_FIELD_CHECKLIST.L3.WORLD.Locations.Location) dynamicItems.push(...getStaticChecklist(COMPLETENESS_FIELD_CHECKLIST.L3.WORLD.Locations.Location, `L3.WORLD.Locations.${loc}`));
-                });
-                const allItemsToProcess = [...staticItems, ...dynamicItems];
+            const all = generateAllItemsLocal(entities)
 
-                // Stage 2: Populate Content
-                setStatus('analyzing');
-                setProgress({ current: 0, total: allItemsToProcess.length });
+            // Stage 2: Generate field content
+            setStatus("analyzing")
+            setProgress({ current: 0, total: all.length })
 
-                let completedCount = 0;
-                const onFieldCompleted = (path: string, content: string) => {
-                    updateFieldContent(path, content);
-                    completedCount++;
-                    setProgress({ current: completedCount, total: allItemsToProcess.length });
-                };
+            await generateContentForAllFields(
+                canonText,
+                all,
+                contractBundle,
+                fieldRules,
+                (path, content) => {
+                    updateFieldContent(path, content)
+                    setProgress((p) => ({ ...p, current: p.current + 1 }))
+                }
+            )
 
-                await generateContentForAllFields(canonText, allItemsToProcess, execContractText, fieldRules, onFieldCompleted);
-                
-                setStatus('success');
-            }, 100);
-
-        } catch (e) {
-            const errorMessage = e instanceof Error ? e.message : 'An unknown error occurred.';
-            setError(errorMessage);
-            setStatus('error');
+            setStatus("success")
+        } catch (e: any) {
+            setError(e?.message || "AI processing failed.")
+            setStatus("error")
         }
-    };
+    }, [
+        canonText,
+        contractBundle,
+        identifyEntities,
+        setIdentifiedEntities,
+        generateAllItemsLocal,
+        generateContentForAllFields,
+        fieldRules,
+        updateFieldContent,
+    ])
 
-    const handleReset = () => {
-        resetCompleteness();
-        setStatus('idle');
-        setError(null);
-        setProgress({ current: 0, total: 0 });
-    };
-
-    const isLoading = status === 'analyzing' || status === 'identifying';
-    
-    let buttonText = "Process";
-    let buttonIcon = BrainCircuit;
-
-    switch (status) {
-        case 'identifying':
-            buttonText = 'Identifying...';
-            buttonIcon = Search;
-            break;
-        case 'analyzing':
-            buttonText = `Generating... (${progress.current}/${progress.total})`;
-            buttonIcon = BrainCircuit;
-            break;
-        case 'success':
-            buttonText = 'Success!';
-            buttonIcon = CheckCircle;
-            break;
-        case 'error':
-            buttonText = 'Error!';
-            buttonIcon = XCircle;
-            break;
-    }
+    const statusIcon =
+        status === "success" ? (
+            <CheckCircle size={18} />
+        ) : status === "error" ? (
+            <XCircle size={18} />
+        ) : status === "analyzing" || status === "identifying" ? (
+            <Search size={18} />
+        ) : (
+            <BrainCircuit size={18} />
+        )
 
     return (
-        <div className="flex items-center gap-4">
-            <button 
-                onClick={handleProcess} 
-                disabled={isLoading || !canonText}
-                className={`flex items-center justify-center px-4 h-9 min-w-[120px] text-white text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 transition-colors ${
-                    isLoading ? 'bg-slate-600 cursor-not-allowed' : 
-                    !canonText ? 'bg-slate-600 cursor-not-allowed' :
-                    status === 'success' ? 'bg-green-600' :
-                    status === 'error' ? 'bg-red-600' :
-                    'bg-sky-600 hover:bg-sky-500 focus:ring-sky-500'
-                }`}
-                aria-label="Process Canon"
+        <div className="flex items-center gap-2">
+            <button
+                onClick={handleProcess}
+                className="flex items-center gap-2 px-3 py-2 rounded-md bg-sky-600 text-white hover:bg-sky-500 transition-colors"
+                aria-label="Run AI processing"
             >
-                <buttonIcon className={`w-4 h-4 mr-2 ${isLoading ? 'animate-spin' : ''}`} />
-                {buttonText}
+                {statusIcon}
+                <span className="text-sm font-medium">
+                    {status === "identifying"
+                        ? "Identifying…"
+                        : status === "analyzing"
+                        ? "Generating…"
+                        : "Process"}
+                </span>
             </button>
-            <div className="relative group">
-                <button 
-                    onClick={handleReset}
-                    className="flex items-center justify-center w-9 h-9 bg-slate-700 text-slate-300 rounded-md hover:bg-slate-600 hover:text-white focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-slate-500 transition-colors"
-                    aria-label="Reset generated content"
-                >
-                    <RotateCcw className="w-4 h-4" />
-                </button>
-                <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-max px-2 py-1 bg-slate-600 text-white text-xs rounded-md opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                    Reset Content
-                </div>
-            </div>
-        </div>
-    );
-};
 
-export default AiProcessor;
+            <button
+                onClick={() => {
+                    resetCompleteness()
+                    setStatus("idle")
+                    setError(null)
+                    setProgress({ current: 0, total: 0 })
+                }}
+                className="flex items-center justify-center w-9 h-9 bg-slate-800 text-slate-200 rounded-md hover:bg-slate-700 transition-colors"
+                aria-label="Reset"
+            >
+                <RotateCcw size={18} />
+            </button>
+
+            {progress.total > 0 && (
+                <div className="text-xs text-slate-400">
+                    {progress.current} / {progress.total}
+                </div>
+            )}
+
+            {error && <div className="text-xs text-red-300 max-w-[380px] truncate">{error}</div>}
+        </div>
+    )
+}
+
+export default AiProcessor
