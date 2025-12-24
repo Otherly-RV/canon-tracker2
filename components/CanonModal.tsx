@@ -1,14 +1,14 @@
-import React, { useEffect, useRef, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Upload, Save, X } from "lucide-react";
-import { useCompleteness } from "../context/CompletenessContext.tsx";
-import { extractTextFromFile } from "../utils/fileReader.ts";
-import { uploadPdfAndExtractPages } from "../utils/uploadPdfAndExtractPages.ts";
+import React, { useEffect, useRef, useState } from "react"
+import { motion, AnimatePresence } from "framer-motion"
+import { Upload, Save, X } from "lucide-react"
+import { useCompleteness } from "../context/CompletenessContext"
+import { extractTextFromFile } from "../utils/fileReader"
+import { uploadPdfAndExtractPages } from "../utils/uploadPdfAndExtractPages"
 
 const Editor: React.FC<{
-  value: string;
-  onChange: (val: string) => void;
-  placeholder?: string;
+  value: string
+  onChange: (val: string) => void
+  placeholder?: string
 }> = ({ value, onChange, placeholder }) => (
   <textarea
     value={value}
@@ -16,12 +16,17 @@ const Editor: React.FC<{
     placeholder={placeholder}
     className="w-full h-[55vh] bg-slate-900/60 border border-slate-700 rounded-lg p-4 text-slate-200 placeholder-slate-500 focus:ring-2 focus:ring-sky-500 focus:outline-none resize-none font-mono text-sm"
   />
-);
+)
 
 type Props = {
-  isOpen: boolean;
-  onClose: () => void;
-};
+  isOpen: boolean
+  onClose: () => void
+}
+
+function isPdf(file: File) {
+  const n = (file.name || "").toLowerCase()
+  return file.type === "application/pdf" || n.endsWith(".pdf")
+}
 
 const CanonModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const {
@@ -29,85 +34,66 @@ const CanonModal: React.FC<Props> = ({ isOpen, onClose }) => {
     setCanonText,
     setExtractedContent,
     setIsViewerVisible,
-
-    // ✅ new: PDF assets
     setPdfBlobUrl,
     setPdfPageImages,
-  } = useCompleteness();
+  } = useCompleteness()
 
-  const [localCanon, setLocalCanon] = useState("");
-  const [status, setStatus] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [localCanon, setLocalCanon] = useState("")
+  const [status, setStatus] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
-    if (!isOpen) return;
-    setLocalCanon(canonText || "");
-    setStatus(null);
-    setErr(null);
-  }, [isOpen, canonText]);
+    if (!isOpen) return
+    setLocalCanon(canonText || "")
+    setStatus(null)
+    setErr(null)
+  }, [isOpen, canonText])
 
-  const onUploadClick = () => fileInputRef.current?.click();
+  const onUploadClick = () => fileInputRef.current?.click()
 
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const file = e.target.files?.[0]
+    if (!file) return
 
-    setErr(null);
-    setStatus("Uploading + extracting (server)…");
+    setErr(null)
+    setStatus("Uploading + extracting…")
 
     try {
-      const isPdf =
-        file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+      if (isPdf(file)) {
+        // ✅ SERVER PIPELINE (DocAI): blob upload + fullText + page images
+        const out = await uploadPdfAndExtractPages(file, "default")
 
-      if (isPdf) {
-        // ✅ Server pipeline:
-        // 1) upload to Blob
-        // 2) DocAI extracts fullText + page images
-        const { pdfBlobUrl, fullText, pageImages } = await uploadPdfAndExtractPages(
-          file,
-          "default"
-        );
+        setPdfBlobUrl(out.pdfBlobUrl)
+        setPdfPageImages(out.pageImages)
 
-        setPdfBlobUrl(pdfBlobUrl);
-        setPdfPageImages(pageImages);
+        setExtractedContent({ content: out.fullText || "", format: "text" })
+        setLocalCanon(out.fullText || "")
+        setIsViewerVisible(true)
 
-        setCanonText(fullText);
-        setExtractedContent({ content: fullText, format: "text" });
-
-        setLocalCanon(fullText);
-        setIsViewerVisible(true);
-
-        setStatus(
-          `Extracted via DocAI ✅ (text + ${pageImages.length} page images). Review and Save.`
-        );
+        setStatus(`Extracted: ${out.pageImages.length} page images, text length ${out.fullText?.length ?? 0}. Review and Save.`)
       } else {
-        // DOCX fallback (client-side)
-        setStatus("Extracting (client)…");
-        const extracted = await extractTextFromFile(file);
-
-        setCanonText(extracted.content);
-        setExtractedContent(extracted);
-
-        setLocalCanon(extracted.content);
-        setIsViewerVisible(true);
-
-        setStatus("Extracted. Review and Save.");
+        // DOCX path stays client-side (mammoth) — fine
+        const extracted = await extractTextFromFile(file)
+        setExtractedContent(extracted)
+        setLocalCanon(extracted.content)
+        setIsViewerVisible(true)
+        setStatus("Extracted. Review and Save.")
       }
     } catch (ex: any) {
-      setStatus(null);
-      setErr(ex?.message || "Failed to extract document.");
+      setStatus(null)
+      setErr(ex?.message || "Failed to extract document.")
     } finally {
-      e.target.value = "";
+      e.target.value = ""
     }
-  };
+  }
 
   const onSave = () => {
-    setCanonText(localCanon);
-    setStatus("Saved.");
-    setTimeout(() => setStatus(null), 1200);
-  };
+    setCanonText(localCanon)
+    setStatus("Saved.")
+    setTimeout(() => setStatus(null), 1200)
+  }
 
   return (
     <AnimatePresence>
@@ -118,7 +104,7 @@ const CanonModal: React.FC<Props> = ({ isOpen, onClose }) => {
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           onMouseDown={(e) => {
-            if (e.target === e.currentTarget) onClose();
+            if (e.target === e.currentTarget) onClose()
           }}
         >
           <motion.div
@@ -132,8 +118,7 @@ const CanonModal: React.FC<Props> = ({ isOpen, onClose }) => {
               <div>
                 <div className="text-slate-100 font-semibold">Canon</div>
                 <div className="text-xs text-slate-400">
-                  Upload PDF/DOCX. PDF uses server extraction (text + page images). Saving
-                  persists across sessions.
+                  Paste text or upload PDF/DOCX. Saving persists across sessions.
                 </div>
               </div>
 
@@ -191,7 +176,7 @@ const CanonModal: React.FC<Props> = ({ isOpen, onClose }) => {
         </motion.div>
       )}
     </AnimatePresence>
-  );
-};
+  )
+}
 
-export default CanonModal;
+export default CanonModal
