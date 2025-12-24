@@ -1,12 +1,18 @@
 // api/pdf-render.js
+import { createRequire } from "module";
 import { createCanvas } from "@napi-rs/canvas";
 import { put } from "@vercel/blob";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-
-// ✅ Hard-disable worker (prevents Vercel from trying to import pdf.worker.mjs)
-pdfjsLib.GlobalWorkerOptions.workerSrc = "";
 
 export const config = { maxDuration: 300 };
+
+// Load pdfjs in a Vercel-friendly way (CJS build)
+const require = createRequire(import.meta.url);
+const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
+
+// ✅ Required to avoid "No GlobalWorkerOptions.workerSrc specified"
+pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
+  "pdfjs-dist/legacy/build/pdf.worker.js"
+);
 
 function clampInt(n, min, max) {
   const x = Number(n);
@@ -15,9 +21,7 @@ function clampInt(n, min, max) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "POST only" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
     const body =
@@ -34,18 +38,16 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing blobUrl" });
     }
 
-    // 1) Download PDF bytes
+    // Fetch PDF bytes
     const r = await fetch(blobUrl);
     if (!r.ok) {
       return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
     }
     const bytes = new Uint8Array(await r.arrayBuffer());
 
-    // 2) Load PDF (server-safe)
     const loadingTask = pdfjsLib.getDocument({
       data: bytes,
-      disableWorker: true,
-      worker: null,
+      disableWorker: false,
       useSystemFonts: true,
     });
 
@@ -57,12 +59,14 @@ export default async function handler(req, res) {
 
     const pageImages = [];
 
-    // 3) Render requested page range to PNG + upload to Blob
     for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const viewport = page.getViewport({ scale });
 
-      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+      const canvas = createCanvas(
+        Math.ceil(viewport.width),
+        Math.ceil(viewport.height)
+      );
       const ctx = canvas.getContext("2d");
 
       await page.render({ canvasContext: ctx, viewport }).promise;
