@@ -1,8 +1,4 @@
 // api/pdf-render.js
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
 import { v1 as documentai } from "@google-cloud/documentai";
 import { PDFDocument } from "pdf-lib";
 import { put } from "@vercel/blob";
@@ -27,20 +23,81 @@ function readJsonBody(req) {
   return req.body ?? {};
 }
 
-function writeCredentialsFileFromEnv() {
-  const raw = need("GCP_SA_KEY_JSON");
-  const fixed = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
+function parseServiceAccountEnv() {
+  const raw0 = need("GCP_SA_KEY_JSON");
+  const raw = raw0.replace(/\r\n/g, "\n");
 
-  const credPath = path.join(os.tmpdir(), "gcp-sa.json");
-  fs.writeFileSync(credPath, fixed, "utf8");
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj?.client_email || !obj?.private_key) throw new Error("Missing fields.");
+    return obj;
+  } catch {
+    // continue
+  }
+
+  if (
+    (raw.startsWith('"') && raw.endsWith('"')) ||
+    (raw.startsWith("'") && raw.endsWith("'"))
+  ) {
+    const unquoted = raw.slice(1, -1);
+    try {
+      const obj = JSON.parse(unquoted);
+      if (!obj?.client_email || !obj?.private_key) throw new Error("Missing fields.");
+      return obj;
+    } catch {
+      // continue
+    }
+  }
+
+  const keyIdx = raw.indexOf('"private_key"');
+  if (keyIdx === -1) {
+    throw new Error(
+      'GCP_SA_KEY_JSON is not valid JSON and does not contain "private_key". Make sure it is the FULL service account JSON.'
+    );
+  }
+
+  const colon = raw.indexOf(":", keyIdx);
+  const openQuote = raw.indexOf('"', colon + 1);
+  const endMarker = "-----END PRIVATE KEY-----";
+  const endMarkerIdx = raw.indexOf(endMarker, openQuote + 1);
+  const closeQuote = raw.indexOf('"', endMarkerIdx + endMarker.length);
+
+  if (colon === -1 || openQuote === -1 || endMarkerIdx === -1 || closeQuote === -1) {
+    throw new Error(
+      "Could not repair GCP_SA_KEY_JSON. Re-paste the original downloaded service account JSON into Vercel."
+    );
+  }
+
+  const keyValueRaw = raw.slice(openQuote + 1, closeQuote);
+  const keyValueEscaped = keyValueRaw
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+
+  const repaired =
+    raw.slice(0, openQuote + 1) + keyValueEscaped + raw.slice(closeQuote);
+
+  try {
+    const obj = JSON.parse(repaired);
+    if (!obj?.client_email || !obj?.private_key) throw new Error("Missing fields.");
+    return obj;
+  } catch (e) {
+    throw new Error(
+      `GCP_SA_KEY_JSON still not valid after repair. Parse error: ${e?.message || e}`
+    );
+  }
 }
 
 function makeDocAIClient() {
-  writeCredentialsFileFromEnv();
+  const sa = parseServiceAccountEnv();
   const location = need("DOCAI_LOCATION");
+
   return new documentai.DocumentProcessorServiceClient({
     apiEndpoint: `${location}-documentai.googleapis.com`,
+    credentials: {
+      client_email: sa.client_email,
+      private_key: sa.private_key,
+    },
   });
 }
 
@@ -87,7 +144,9 @@ export default async function handler(req, res) {
     }
 
     const r = await fetch(blobUrl);
-    if (!r.ok) return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+    if (!r.ok) {
+      return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+    }
     const pdfBuf = Buffer.from(await r.arrayBuffer());
 
     const src = await PDFDocument.load(pdfBuf);
@@ -114,6 +173,7 @@ export default async function handler(req, res) {
       });
 
       const pages = doc.pages || [];
+
       for (let i = 0; i < pages.length; i++) {
         const globalPage = start + 1 + i;
 
