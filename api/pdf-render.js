@@ -9,6 +9,9 @@ import { put } from "@vercel/blob";
 
 export const config = { maxDuration: 300 };
 
+// Chunk size (internal). Still returns ALL images in one response.
+const DOCAI_PAGES_PER_CALL = 15;
+
 function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -26,19 +29,13 @@ function readJsonBody(req) {
   return req.body ?? {};
 }
 
-function writeCredsToTmp() {
-  // Use your single env var JSON (same as extractor app)
-  const raw = need("GCP_SA_KEY_JSON");
-  const fixed = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
-  const p = path.join(os.tmpdir(), "gcp-sa.json");
-  fs.writeFileSync(p, fixed, "utf8");
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = p;
-}
+function writeCredsToTmpFromB64() {
+  const b64 = need("GCP_SA_KEY_JSON_B64");
+  const json = Buffer.from(b64, "base64").toString("utf8");
 
-function clampInt(n, min, max) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return min;
-  return Math.max(min, Math.min(max, Math.floor(x)));
+  const p = path.join(os.tmpdir(), "gcp-sa.json");
+  fs.writeFileSync(p, json, "utf8");
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = p;
 }
 
 function mimeToExt(mimeType) {
@@ -73,7 +70,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
-    writeCredsToTmp();
+    writeCredsToTmpFromB64();
 
     const projectId = need("GCP_PROJECT_ID");
     const location = need("DOCAI_LOCATION");
@@ -88,87 +85,79 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing blobUrl" });
     }
 
-    // Requested page range (1-indexed)
-    const reqStart = body?.startPage ?? 1;
-    const reqEnd = body?.endPage ?? 1;
-
-    // 1) Download source PDF from blob
+    // 1) Download PDF
     const r = await fetch(blobUrl);
     if (!r.ok) {
       return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
     }
-    const srcBuf = Buffer.from(await r.arrayBuffer());
+    const pdfBuf = Buffer.from(await r.arrayBuffer());
 
-    // 2) Split range with pdf-lib
-    const src = await PDFDocument.load(srcBuf);
+    // 2) Total pages
+    const src = await PDFDocument.load(pdfBuf);
     const totalPages = src.getPageCount();
 
-    const startPage = clampInt(reqStart, 1, totalPages);
-    const endPage = clampInt(reqEnd, startPage, totalPages);
-
-    const chunk = await PDFDocument.create();
-    const indices = Array.from(
-      { length: endPage - startPage + 1 },
-      (_, i) => startPage - 1 + i
-    );
-    const copied = await chunk.copyPages(src, indices);
-    copied.forEach((p) => chunk.addPage(p));
-    const chunkBytes = await chunk.save();
-
-    // 3) DocAI on that chunk
-    const doc = await docaiProcessPdfBytes({
-      projectId,
-      location,
-      processorId,
-      pdfBytes: chunkBytes,
-    });
-
-    // 4) Upload page images returned by DocAI
     const pageImages = [];
-    const pages = doc.pages || [];
+    let imagesMissingCount = 0;
 
-    for (let i = 0; i < pages.length; i++) {
-      const globalPage = startPage + i;
+    // 3) Chunk internally; still returns ALL images
+    for (let start = 0; start < totalPages; start += DOCAI_PAGES_PER_CALL) {
+      const end = Math.min(totalPages, start + DOCAI_PAGES_PER_CALL);
 
-      const img = pages[i]?.image;
-      const content = img?.content;
-      const mimeType = img?.mimeType || "image/png";
+      const chunk = await PDFDocument.create();
+      const indices = Array.from({ length: end - start }, (_, i) => start + i);
+      const copied = await chunk.copyPages(src, indices);
+      copied.forEach((p) => chunk.addPage(p));
+      const chunkBytes = await chunk.save();
 
-      // IMPORTANT: if content is missing, your processor does NOT return images
-      if (!content) continue;
-
-      const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
-      const ext = mimeToExt(mimeType);
-
-      const key = `${prefix}/page-${String(globalPage).padStart(3, "0")}.${ext}`;
-
-      const blob = await put(key, bytes, {
-        access: "public",
-        contentType: mimeType,
+      const doc = await docaiProcessPdfBytes({
+        projectId,
+        location,
+        processorId,
+        pdfBytes: chunkBytes,
       });
 
-      pageImages.push({
-        page: globalPage,
-        imageUrl: blob.url,
-        width: img?.width || 0,
-        height: img?.height || 0,
-        source: "docai",
-      });
+      const pages = doc.pages || [];
+
+      for (let i = 0; i < pages.length; i++) {
+        const globalPage = start + 1 + i; // 1-indexed
+
+        const img = pages[i]?.image;
+        const content = img?.content;
+        const mimeType = img?.mimeType || "image/png";
+
+        if (!content) {
+          imagesMissingCount += 1;
+          continue;
+        }
+
+        const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
+        const ext = mimeToExt(mimeType);
+
+        const key = `${prefix}/page-${String(globalPage).padStart(3, "0")}.${ext}`;
+        const blob = await put(key, bytes, {
+          access: "public",
+          contentType: mimeType,
+        });
+
+        pageImages.push({
+          page: globalPage,
+          imageUrl: blob.url,
+          width: img?.width || 0,
+          height: img?.height || 0,
+          source: "docai",
+        });
+      }
     }
 
     return res.status(200).json({
       ok: true,
       pageCount: totalPages,
-      startPage,
-      endPage,
       pageImages,
       hasPageImages: pageImages.length > 0,
-      note: pageImages.length
-        ? "Images returned by DocAI and uploaded to Blob."
-        : "DocAI returned no page.image.content for this processor/PDF.",
+      imagesMissingCount,
     });
   } catch (e) {
-    console.error("pdf-render (docai) error:", e);
+    console.error("pdf-render error:", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 }
