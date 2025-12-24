@@ -1,4 +1,8 @@
 // api/pdf-pages.js
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { v1 as documentai } from "@google-cloud/documentai";
 import { PDFDocument } from "pdf-lib";
 
@@ -22,33 +26,22 @@ function readJsonBody(req) {
   return req.body ?? {};
 }
 
-function getServiceAccountFromEnv() {
-  // This is still "using env vars"; we are not writing any raw string anywhere.
+function writeCredentialsFileFromEnv() {
+  // DO NOT JSON.parse this. Just write it to a temp json file.
+  // If Vercel stored \n literally as two chars, convert them to real newlines.
   const raw = need("GCP_SA_KEY_JSON");
-
-  // Vercel sometimes stores the private_key newlines as "\n" (escaped)
-  // or as literal newlines. This makes JSON.parse stable.
   const fixed = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
 
-  try {
-    return JSON.parse(fixed);
-  } catch (e) {
-    throw new Error(
-      `GCP_SA_KEY_JSON is not valid JSON. Re-save it in Vercel as a single JSON object string. Parse error: ${e?.message || e}`
-    );
-  }
+  const credPath = path.join(os.tmpdir(), "gcp-sa.json");
+  fs.writeFileSync(credPath, fixed, "utf8");
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
 }
 
 function makeDocAIClient() {
-  const sa = getServiceAccountFromEnv();
+  writeCredentialsFileFromEnv();
   const location = need("DOCAI_LOCATION");
-
   return new documentai.DocumentProcessorServiceClient({
     apiEndpoint: `${location}-documentai.googleapis.com`,
-    credentials: {
-      client_email: sa.client_email,
-      private_key: sa.private_key,
-    },
   });
 }
 
@@ -86,16 +79,13 @@ export default async function handler(req, res) {
     }
 
     const r = await fetch(blobUrl);
-    if (!r.ok) {
-      return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
-    }
+    if (!r.ok) return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
     const pdfBuf = Buffer.from(await r.arrayBuffer());
 
     const src = await PDFDocument.load(pdfBuf);
     const totalPages = src.getPageCount();
 
     const textParts = [];
-
     for (let start = 0; start < totalPages; start += DOCAI_PAGES_PER_CALL) {
       const end = Math.min(totalPages, start + DOCAI_PAGES_PER_CALL);
 
