@@ -1,6 +1,7 @@
-// api/pdf-pages.js
+// api/pdf-render.js
 import { v1 as documentai } from "@google-cloud/documentai";
 import { PDFDocument } from "pdf-lib";
+import { put } from "@vercel/blob";
 
 export const config = { maxDuration: 300 };
 const DOCAI_PAGES_PER_CALL = 15;
@@ -23,11 +24,7 @@ function readJsonBody(req) {
 }
 
 function getServiceAccountFromEnv() {
-  // This is still "using env vars"; we are not writing any raw string anywhere.
   const raw = need("GCP_SA_KEY_JSON");
-
-  // Vercel sometimes stores the private_key newlines as "\n" (escaped)
-  // or as literal newlines. This makes JSON.parse stable.
   const fixed = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
 
   try {
@@ -50,6 +47,14 @@ function makeDocAIClient() {
       private_key: sa.private_key,
     },
   });
+}
+
+function mimeToExt(mimeType) {
+  const m = (mimeType || "").toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("webp")) return "webp";
+  return "png";
 }
 
 async function docaiProcessPdfBytes({ client, projectId, location, processorId, pdfBytes }) {
@@ -80,6 +85,7 @@ export default async function handler(req, res) {
 
     const body = readJsonBody(req);
     const blobUrl = body?.blobUrl;
+    const prefix = body?.prefix || `docai-pages/${Date.now()}`;
 
     if (!blobUrl || typeof blobUrl !== "string") {
       return res.status(400).json({ error: "Missing blobUrl" });
@@ -94,7 +100,8 @@ export default async function handler(req, res) {
     const src = await PDFDocument.load(pdfBuf);
     const totalPages = src.getPageCount();
 
-    const textParts = [];
+    const pageImages = [];
+    let imagesMissingCount = 0;
 
     for (let start = 0; start < totalPages; start += DOCAI_PAGES_PER_CALL) {
       const end = Math.min(totalPages, start + DOCAI_PAGES_PER_CALL);
@@ -113,16 +120,48 @@ export default async function handler(req, res) {
         pdfBytes: chunkBytes,
       });
 
-      if (doc.text) textParts.push(doc.text);
+      const pages = doc.pages || [];
+
+      for (let i = 0; i < pages.length; i++) {
+        const globalPage = start + 1 + i;
+
+        const img = pages[i]?.image;
+        const content = img?.content;
+        const mimeType = img?.mimeType || "image/png";
+
+        if (!content) {
+          imagesMissingCount += 1;
+          continue;
+        }
+
+        const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
+        const ext = mimeToExt(mimeType);
+
+        const key = `${prefix}/page-${String(globalPage).padStart(3, "0")}.${ext}`;
+        const blob = await put(key, bytes, {
+          access: "public",
+          contentType: mimeType,
+        });
+
+        pageImages.push({
+          page: globalPage,
+          imageUrl: blob.url,
+          width: img?.width || 0,
+          height: img?.height || 0,
+          source: "docai",
+        });
+      }
     }
 
     return res.status(200).json({
       ok: true,
       pageCount: totalPages,
-      fullText: textParts.join("\n\n"),
+      pageImages,
+      hasPageImages: pageImages.length > 0,
+      imagesMissingCount,
     });
   } catch (e) {
-    console.error("pdf-pages error:", e);
+    console.error("pdf-render error:", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 }
