@@ -1,21 +1,40 @@
 // api/pdf-pages.js
-import { createRequire } from "module";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 export const config = { maxDuration: 300 };
 
-// Load pdfjs in a Vercel-friendly way (CJS build)
-const require = createRequire(import.meta.url);
-const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
+// Resolve worker URL in a way that works in Node/Vercel
+const WORKER_CANDIDATES = [
+  "pdfjs-dist/legacy/build/pdf.worker.mjs",
+  "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
+  "pdfjs-dist/build/pdf.worker.mjs",
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+];
 
-// ✅ This is the key fix: give pdfjs a real worker path it can resolve.
-pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
-  "pdfjs-dist/legacy/build/pdf.worker.js"
-);
+let resolvedWorkerSrc = null;
+for (const spec of WORKER_CANDIDATES) {
+  try {
+    // Node 20+: import.meta.resolve returns a URL string (e.g. file:///var/task/...)
+    resolvedWorkerSrc = import.meta.resolve(spec);
+    break;
+  } catch {}
+}
+
+if (resolvedWorkerSrc) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = resolvedWorkerSrc;
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
+    if (!resolvedWorkerSrc) {
+      return res.status(500).json({
+        error:
+          'pdfjs worker not found. Tried: ' + WORKER_CANDIDATES.join(", "),
+      });
+    }
+
     const body =
       typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
 
@@ -36,8 +55,7 @@ export default async function handler(req, res) {
 
     const loadingTask = pdfjsLib.getDocument({
       data: bytes,
-      // You can keep worker enabled now that workerSrc is valid.
-      // If you prefer: disableWorker: true is also OK, workerSrc is still required.
+      // You can keep workers enabled now that workerSrc is set
       disableWorker: false,
       useSystemFonts: true,
     });
@@ -70,6 +88,7 @@ export default async function handler(req, res) {
       fullText: parts.join("\n\n"),
       pageImages: [],
       pagesWithImages: 0,
+      workerSrc: resolvedWorkerSrc,
     });
   } catch (e) {
     console.error("pdf-pages error:", e);
