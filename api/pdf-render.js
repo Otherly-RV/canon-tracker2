@@ -1,6 +1,10 @@
+// api/pdf-render.js
 import { createCanvas } from "@napi-rs/canvas";
 import { put } from "@vercel/blob";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+
+// ✅ Hard-disable worker (prevents Vercel from trying to import pdf.worker.mjs)
+pdfjsLib.GlobalWorkerOptions.workerSrc = "";
 
 export const config = { maxDuration: 300 };
 
@@ -41,6 +45,7 @@ export default async function handler(req, res) {
     const loadingTask = pdfjsLib.getDocument({
       data: bytes,
       disableWorker: true,
+      worker: null,
       useSystemFonts: true,
     });
 
@@ -52,15 +57,12 @@ export default async function handler(req, res) {
 
     const pageImages = [];
 
-    // 3) Render to PNG + upload to Blob
+    // 3) Render requested page range to PNG + upload to Blob
     for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const viewport = page.getViewport({ scale });
 
-      const canvas = createCanvas(
-        Math.ceil(viewport.width),
-        Math.ceil(viewport.height)
-      );
+      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
       const ctx = canvas.getContext("2d");
 
       await page.render({ canvasContext: ctx, viewport }).promise;
