@@ -1,29 +1,11 @@
 // api/pdf-render.js
-import { createCanvas } from "@napi-rs/canvas";
 import { put } from "@vercel/blob";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import sharpPkg from "sharp";
 
 export const config = { maxDuration: 300 };
 
-// Resolve worker URL in a way that works in Node/Vercel
-const WORKER_CANDIDATES = [
-  "pdfjs-dist/legacy/build/pdf.worker.mjs",
-  "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
-  "pdfjs-dist/build/pdf.worker.mjs",
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-];
-
-let resolvedWorkerSrc = null;
-for (const spec of WORKER_CANDIDATES) {
-  try {
-    resolvedWorkerSrc = import.meta.resolve(spec);
-    break;
-  } catch {}
-}
-
-if (resolvedWorkerSrc) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = resolvedWorkerSrc;
-}
+// sharp is CommonJS; this makes it work in ESM deployments too
+const sharp = sharpPkg.default ?? sharpPkg;
 
 function clampInt(n, min, max) {
   const x = Number(n);
@@ -35,19 +17,12 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
-    if (!resolvedWorkerSrc) {
-      return res.status(500).json({
-        error:
-          'pdfjs worker not found. Tried: ' + WORKER_CANDIDATES.join(", "),
-      });
-    }
-
     const body =
       typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
 
     const blobUrl = body?.blobUrl;
-    const prefix = body?.prefix || `pdf-render/${Date.now()}`;
-    const scale = Number(body?.scale ?? 1.25);
+    const prefix = body?.prefix || `pdf-pages/${Date.now()}`;
+    const density = typeof body?.density === "number" ? body.density : 150;
 
     let startPage = body?.startPage ?? 1;
     let endPage = body?.endPage ?? 1;
@@ -56,43 +31,46 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing blobUrl" });
     }
 
+    // 1) Download PDF
     const r = await fetch(blobUrl);
     if (!r.ok) {
       return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
     }
+    const pdfBuffer = Buffer.from(await r.arrayBuffer());
 
-    const bytes = new Uint8Array(await r.arrayBuffer());
+    // 2) Determine page count via sharp metadata (no pdfjs)
+    // Some PDFs might not expose pages cleanly; if metadata.pages is missing, we still render requested range.
+    let totalPages = null;
+    try {
+      const m = await sharp(pdfBuffer, { density }).metadata();
+      if (typeof m.pages === "number" && m.pages > 0) totalPages = m.pages;
+    } catch {
+      // ignore: we'll still attempt render
+    }
 
-    const loadingTask = pdfjsLib.getDocument({
-      data: bytes,
-      disableWorker: false,
-      useSystemFonts: true,
-    });
-
-    const pdf = await loadingTask.promise;
-    const pageCount = pdf.numPages;
-
-    startPage = clampInt(startPage, 1, pageCount);
-    endPage = clampInt(endPage, startPage, pageCount);
+    if (totalPages) {
+      startPage = clampInt(startPage, 1, totalPages);
+      endPage = clampInt(endPage, startPage, totalPages);
+    } else {
+      // fallback clamp (still safe)
+      startPage = clampInt(startPage, 1, 9999);
+      endPage = clampInt(endPage, startPage, 9999);
+    }
 
     const pageImages = [];
 
+    // 3) Render each page to PNG and upload
     for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const viewport = page.getViewport({ scale });
+      // sharp uses 0-based page index
+      const pageIndex = pageNum - 1;
 
-      const canvas = createCanvas(
-        Math.ceil(viewport.width),
-        Math.ceil(viewport.height)
-      );
-      const ctx = canvas.getContext("2d");
+      const img = sharp(pdfBuffer, { density, page: pageIndex }).png();
+      const meta = await img.metadata();
+      const pngBuffer = await img.toBuffer();
 
-      await page.render({ canvasContext: ctx, viewport }).promise;
-
-      const png = canvas.toBuffer("image/png");
       const key = `${prefix}/page-${String(pageNum).padStart(3, "0")}.png`;
 
-      const blob = await put(key, png, {
+      const blob = await put(key, pngBuffer, {
         access: "public",
         contentType: "image/png",
       });
@@ -100,19 +78,18 @@ export default async function handler(req, res) {
       pageImages.push({
         page: pageNum,
         imageUrl: blob.url,
-        width: canvas.width,
-        height: canvas.height,
+        width: meta.width ?? 0,
+        height: meta.height ?? 0,
       });
     }
 
     return res.status(200).json({
       ok: true,
-      pageCount,
+      pageCount: totalPages, // may be null; client can use pdf-pages for count
       startPage,
       endPage,
       pagesRendered: pageImages.length,
       pageImages,
-      workerSrc: resolvedWorkerSrc,
     });
   } catch (e) {
     console.error("pdf-render error:", e);
