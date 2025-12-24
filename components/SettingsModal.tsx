@@ -3,15 +3,15 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X, Upload, Save, AlertTriangle, Copy, Download } from "lucide-react";
 import { upload } from "@vercel/blob/client";
 
-import { useCompleteness } from "../context/CompletenessContext.tsx";
-import { extractTextFromFile } from "../utils/fileReader.ts";
+import { useCompleteness } from "../context/CompletenessContext";
+import { extractTextFromFile } from "../utils/fileReader";
 
 type Tab = "canon" | "contract" | "rules";
 
 type PdfPagesResponse = {
-  ok: boolean;
-  fullText: string;
-  pageImages: Array<{ page: number; imageUrl: string; width: number; height: number }>;
+  ok?: boolean;
+  fullText?: string;
+  pageImages?: Array<{ page: number; imageUrl: string; width: number; height: number }>;
 };
 
 const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isOpen, onClose }) => {
@@ -24,10 +24,13 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
     setFieldRules,
     setExtractedContent,
 
-    // NEW (6B)
+    // pdf assets
     pdfPageImages,
     setPdfPageImages,
     setPdfBlobUrl,
+
+    // IMPORTANT for auto-assign L1 posters
+    updateFieldContent,
   } = useCompleteness();
 
   const [activeTab, setActiveTab] = useState<Tab>("canon");
@@ -61,12 +64,11 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
       setExecContractText(localContract);
     } else if (tab === "rules") {
       try {
-        const parsedRules = JSON.parse(localRules);
-        setFieldRules(parsedRules);
+        const parsed = JSON.parse(localRules);
+        setFieldRules(parsed);
         setRulesError(null);
-      } catch (e) {
-        setRulesError(e instanceof Error ? e.message : "Invalid JSON format.");
-        return;
+      } catch (e: any) {
+        setRulesError(e?.message || "Invalid JSON format.");
       }
     }
   };
@@ -91,7 +93,6 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
   };
 
   async function uploadPdfToBlob(file: File) {
-    // IMPORTANT: same client upload pattern as your test
     return upload(`uploads/${Date.now()}-${file.name}`, file, {
       access: "public",
       handleUploadUrl: "/api/blob-upload",
@@ -99,13 +100,13 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
     });
   }
 
-  async function extractPdfPagesFromServer(pdfBlobUrl: string) {
+  async function extractPdfPagesFromServer(pdfBlobUrl: string, fileName: string) {
     const r = await fetch("/api/pdf-pages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         blobUrl: pdfBlobUrl,
-        prefix: `pdf-pages/${Date.now()}-${fileInputRef.current?.files?.[0]?.name || "upload"}`,
+        prefix: `pdf-pages/${Date.now()}-${fileName}`,
       }),
     });
 
@@ -127,8 +128,8 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
         const up = await uploadPdfToBlob(file);
         setPdfBlobUrl(up.url);
 
-        // 2) call server to run DocAI and return page images + full text
-        const result = await extractPdfPagesFromServer(up.url);
+        // 2) server extracts page images + text
+        const result = await extractPdfPagesFromServer(up.url, file.name);
 
         // 3) update canon text
         const fullText = String(result.fullText || "");
@@ -136,16 +137,27 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
         setLocalCanon(fullText);
         setCanonText(fullText);
 
-        // 4) store pdf page images (Blob URLs returned by server)
+        // 4) store page images
         const pages = Array.isArray(result.pageImages) ? result.pageImages : [];
-        setPdfPageImages(
-          pages.map((p) => ({
-            page: Number(p.page),
-            url: String(p.imageUrl),
-            width: Number(p.width || 0),
-            height: Number(p.height || 0),
-          }))
-        );
+        const normalized = pages.map((p) => ({
+          page: Number(p.page),
+          url: String(p.imageUrl),
+          width: Number(p.width || 0),
+          height: Number(p.height || 0),
+        }));
+        setPdfPageImages(normalized);
+
+        // 5) AUTO-ASSIGN: make Level 1 KeyArtPoster show an image immediately
+        if (normalized.length > 0) {
+          const firstUrl = normalized[0].url;
+
+          updateFieldContent("L1.OVERVIEW.KeyArtPoster", firstUrl);
+          updateFieldContent("L1.CHARACTERS.KeyArtPoster", firstUrl);
+          updateFieldContent("L1.WORLD.KeyArtPoster", firstUrl);
+          updateFieldContent("L1.LORE.KeyArtPoster", firstUrl);
+          updateFieldContent("L1.STYLE.KeyArtPoster", firstUrl);
+          updateFieldContent("L1.STORY.KeyArtPoster", firstUrl);
+        }
       } else {
         // DOCX fallback = text only
         const extracted = await extractTextFromFile(file);
@@ -159,7 +171,6 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
         setLocalCanon(plainText);
         setCanonText(plainText);
 
-        // clear pdf images for non-pdf
         setPdfBlobUrl(null);
         setPdfPageImages([]);
       }
@@ -292,7 +303,7 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
                     </div>
                   )}
 
-                  {/* NEW: show extracted PDF page images */}
+                  {/* PDF image bank preview (optional but helpful) */}
                   {pdfPageImages.length > 0 && (
                     <div className="mb-3">
                       <div className="text-sm text-slate-300 mb-2">
@@ -329,7 +340,11 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
 
               {activeTab === "rules" && (
                 <div className="h-full flex flex-col">
-                  <TabHeader onSave={() => handleSave("rules")} onCopy={() => handleCopy(localRules)} onDownload={handleDownload} />
+                  <TabHeader
+                    onSave={() => handleSave("rules")}
+                    onCopy={() => handleCopy(localRules)}
+                    onDownload={handleDownload}
+                  />
                   <Editor value={localRules} onChange={setLocalRules} />
                   {rulesError && (
                     <div className="flex items-center gap-2 text-sm text-red-400 bg-red-900/30 p-3 rounded-md mt-4">
@@ -342,7 +357,10 @@ const SettingsModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isO
             </main>
 
             <footer className="flex justify-end p-4 border-t border-slate-700">
-              <button onClick={onClose} className="px-4 py-2 text-sm bg-slate-600 text-white rounded-md hover:bg-slate-500">
+              <button
+                onClick={onClose}
+                className="px-4 py-2 text-sm bg-slate-600 text-white rounded-md hover:bg-slate-500"
+              >
                 Close
               </button>
             </footer>
