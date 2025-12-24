@@ -125,7 +125,7 @@ export default function ImageFieldSlot({ path, label }: Props) {
               Detected text in an image field (will NOT be used as an image URL)
             </div>
             <div className="text-xs text-slate-400 whitespace-pre-wrap">
-              {truncate(promptText, 400)}
+              {truncate(promptText, 140)}
             </div>
           </div>
         ) : null}
