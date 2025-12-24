@@ -1,9 +1,16 @@
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-
-// ✅ Hard-disable worker (prevents Vercel from trying to import pdf.worker.mjs)
-pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+// api/pdf-pages.js
+import { createRequire } from "module";
 
 export const config = { maxDuration: 300 };
+
+// Load pdfjs in a Vercel-friendly way (CJS build)
+const require = createRequire(import.meta.url);
+const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
+
+// ✅ This is the key fix: give pdfjs a real worker path it can resolve.
+pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
+  "pdfjs-dist/legacy/build/pdf.worker.js"
+);
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
@@ -21,15 +28,17 @@ export default async function handler(req, res) {
     }
 
     const r = await fetch(blobUrl);
-    if (!r.ok) return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+    if (!r.ok) {
+      return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+    }
 
     const bytes = new Uint8Array(await r.arrayBuffer());
 
     const loadingTask = pdfjsLib.getDocument({
       data: bytes,
-      // ✅ these two are what matters on Vercel
-      disableWorker: true,
-      worker: null,
+      // You can keep worker enabled now that workerSrc is valid.
+      // If you prefer: disableWorker: true is also OK, workerSrc is still required.
+      disableWorker: false,
       useSystemFonts: true,
     });
 
