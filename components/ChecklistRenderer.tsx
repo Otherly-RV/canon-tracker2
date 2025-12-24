@@ -2,15 +2,7 @@ import React from "react";
 import type { ChecklistRendererProps } from "../types";
 import FieldDisplay from "./FieldDisplay";
 import ImageFieldSlot from "./ImageFieldSlot";
-
-function isImageLeaf(leaf: string) {
-  // Minimal but effective: make KeyArtPoster an image (L1 requirement),
-  // plus common image-ish names for later.
-  return (
-    leaf === "KeyArtPoster" ||
-    /(^|_)LeadImage$|SupportingImages|SecondaryImages|PoseSheet|Poster|Palette|Swatch|TileBoard|Map|Symbol|Imgs/i.test(leaf)
-  );
-}
+import { isImagePath } from "../data/schema-runtime.ts";
 
 const ChecklistRenderer: React.FC<ChecklistRendererProps> = ({ data, pathPrefix }) => {
   // Leaf array
@@ -23,7 +15,7 @@ const ChecklistRenderer: React.FC<ChecklistRendererProps> = ({ data, pathPrefix 
 
           return (
             <li key={`${path}-${idx}`}>
-              {isImageLeaf(leafName) ? (
+              {isImagePath(path) ? (
                 <ImageFieldSlot label={leafName} path={path} />
               ) : (
                 <FieldDisplay path={path} label={leafName} />
