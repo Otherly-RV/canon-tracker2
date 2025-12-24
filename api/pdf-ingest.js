@@ -1,29 +1,22 @@
-// api/pdf-ingest.js
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+
 import { v1 as documentai } from "@google-cloud/documentai";
 import { PDFDocument } from "pdf-lib";
-import { put } from "@vercel/blob";
 import sharp from "sharp";
-import { GoogleGenAI } from "@google/genai";
+import { put } from "@vercel/blob";
 
 export const config = { maxDuration: 300 };
 
-// Chunk size: DocAI calls per N pages
-const DOCAI_PAGES_PER_CALL = 12;
-// Tagging batch size: Gemini request per N pages
-const TAG_BATCH_SIZE = 6;
+// DocAI has page limits; we chunk.
+const DOCAI_MAX_PAGES_PER_CALL = 15;
 
-function need(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
-}
+// ---------- helpers ----------
 
-function opt(name) {
-  const v = process.env[name];
-  return v || null;
-}
-
-function readJsonBody(req) {
+function jsonBody(req) {
+  if (!req.body) return {};
   if (typeof req.body === "string") {
     try {
       return JSON.parse(req.body || "{}");
@@ -34,434 +27,344 @@ function readJsonBody(req) {
   return req.body ?? {};
 }
 
-/**
- * Fix common Vercel env paste issues:
- * - private_key has literal newlines inside JSON -> invalid JSON
- * This repairs ONLY private_key, then parses.
- */
-function parseServiceAccountEnv() {
-  const raw0 = need("GCP_SA_KEY_JSON");
-  const raw = raw0.replace(/\r\n/g, "\n");
+function ensureCreds() {
+  const raw = process.env.GCP_SA_KEY_JSON;
+  if (!raw) throw new Error("Missing env var: GCP_SA_KEY_JSON");
 
-  // A) already valid JSON
+  // Some environments accidentally store base64. Support both.
+  let obj;
   try {
-    const obj = JSON.parse(raw);
-    if (!obj?.client_email || !obj?.private_key) throw new Error("Missing fields.");
-    return obj;
+    obj = JSON.parse(raw);
   } catch {
-    // continue
-  }
-
-  // B) double-quoted JSON string
-  if (
-    (raw.startsWith('"') && raw.endsWith('"')) ||
-    (raw.startsWith("'") && raw.endsWith("'"))
-  ) {
-    const unquoted = raw.slice(1, -1);
     try {
-      const obj = JSON.parse(unquoted);
-      if (!obj?.client_email || !obj?.private_key) throw new Error("Missing fields.");
-      return obj;
-    } catch {
-      // continue
+      const decoded = Buffer.from(raw, "base64").toString("utf-8");
+      obj = JSON.parse(decoded);
+    } catch (e) {
+      throw new Error(
+        `GCP_SA_KEY_JSON is not valid JSON (or base64 JSON). ${e?.message || e}`
+      );
     }
   }
 
-  // C) repair private_key
-  const keyIdx = raw.indexOf('"private_key"');
-  if (keyIdx === -1) {
-    throw new Error(
-      'GCP_SA_KEY_JSON is not valid JSON and does not contain "private_key". Paste the FULL service account JSON.'
-    );
-  }
+  const tmp = path.join(os.tmpdir(), "gcp-sa.json");
+  fs.writeFileSync(tmp, JSON.stringify(obj));
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = tmp;
 
-  const colon = raw.indexOf(":", keyIdx);
-  const openQuote = raw.indexOf('"', colon + 1);
-
-  const endMarker = "-----END PRIVATE KEY-----";
-  const endMarkerIdx = raw.indexOf(endMarker, openQuote + 1);
-  const closeQuote = raw.indexOf('"', endMarkerIdx + endMarker.length);
-
-  if (colon === -1 || openQuote === -1 || endMarkerIdx === -1 || closeQuote === -1) {
-    throw new Error("Could not repair GCP_SA_KEY_JSON. Re-paste the original JSON.");
-  }
-
-  const keyValueRaw = raw.slice(openQuote + 1, closeQuote);
-  const keyValueEscaped = keyValueRaw
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n");
-
-  const repaired =
-    raw.slice(0, openQuote + 1) + keyValueEscaped + raw.slice(closeQuote);
-
-  const obj = JSON.parse(repaired);
-  if (!obj?.client_email || !obj?.private_key) {
-    throw new Error("GCP_SA_KEY_JSON parsed but missing client_email/private_key.");
-  }
-  return obj;
+  const projectFromKey =
+    obj.project_id || process.env.GCP_PROJECT_ID || process.env.GCP_PROJECT;
+  return { tmp, projectFromKey };
 }
 
-function makeDocAIClient() {
-  const sa = parseServiceAccountEnv();
-  const location = need("DOCAI_LOCATION");
+function sha1(s) {
+  return createHash("sha1").update(String(s)).digest("hex");
+}
 
-  return new documentai.DocumentProcessorServiceClient({
+function pickProjectId(projectFromKey) {
+  return (
+    process.env.GCP_PROJECT_ID ||
+    process.env.GCP_PROJECT ||
+    process.env.GCLOUD_PROJECT ||
+    projectFromKey
+  );
+}
+
+function cleanPrefixSegment(s) {
+  return String(s || "")
+    .trim()
+    .replace(/[^\w.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80);
+}
+
+function extractFromTextAnchor(fullText, anchor) {
+  const segs = anchor?.textSegments || anchor?.text_segments || [];
+  if (!segs.length) return "";
+  let out = "";
+  for (const seg of segs) {
+    const start = Number(seg.startIndex ?? seg.start_index ?? 0);
+    const end = Number(seg.endIndex ?? seg.end_index ?? 0);
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+      out += fullText.slice(start, end);
+    }
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+function simpleKeywords(text, max = 12) {
+  const t = (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return [];
+  const stop = new Set([
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "this",
+    "that",
+    "it",
+    "as",
+    "at",
+    "by",
+    "from",
+    "into",
+    "over",
+    "after",
+    "before",
+    "then",
+    "than",
+    "but",
+    "not",
+    "no",
+    "so",
+    "if",
+    "we",
+    "you",
+    "they",
+    "he",
+    "she",
+    "i",
+  ]);
+
+  const freq = new Map();
+  for (const w of t.split(" ")) {
+    if (w.length < 3) continue;
+    if (stop.has(w)) continue;
+    freq.set(w, (freq.get(w) || 0) + 1);
+  }
+
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, max)
+    .map(([w]) => w);
+}
+
+async function processDocAI({ project, location, processorId, pdfBuf }) {
+  const client = new documentai.DocumentProcessorServiceClient({
     apiEndpoint: `${location}-documentai.googleapis.com`,
-    credentials: {
-      client_email: sa.client_email,
-      private_key: sa.private_key,
-    },
   });
-}
 
-async function docaiProcessPdfBytes({ client, projectId, location, processorId, pdfBytes }) {
-  const name = `projects/${projectId}/locations/${location}/processors/${processorId}`;
+  const name = `projects/${project}/locations/${location}/processors/${processorId}`;
 
   const [result] = await client.processDocument({
     name,
-    rawDocument: {
-      content: Buffer.from(pdfBytes).toString("base64"),
-      mimeType: "application/pdf",
-    },
+    rawDocument: { content: pdfBuf, mimeType: "application/pdf" },
   });
 
-  const doc = result?.document;
-  if (!doc) throw new Error("DocAI returned no document");
-  return doc;
+  return result.document;
 }
 
-function safeSliceBySegments(text, segments) {
-  if (!text || !Array.isArray(segments) || segments.length === 0) return "";
-  let out = "";
-  for (const seg of segments) {
-    const start = Number(seg?.startIndex ?? 0);
-    const end = Number(seg?.endIndex ?? 0);
-    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-      out += text.slice(start, end);
-    }
-  }
-  return out;
+async function makeSubPdf(pdfBytes, start0, end0Exclusive) {
+  const src = await PDFDocument.load(pdfBytes);
+  const out = await PDFDocument.create();
+  const indices = [];
+  for (let i = start0; i < end0Exclusive; i++) indices.push(i);
+  const copied = await out.copyPages(src, indices);
+  copied.forEach((p) => out.addPage(p));
+  return await out.save();
 }
 
-/**
- * Extract per-page text using DocAI page.layout.textAnchor -> doc.text
- */
-function getPerPageTextFromDoc(doc) {
-  const text = doc.text || "";
-  const pages = doc.pages || [];
-
-  return pages.map((p) => {
-    const segs = p?.layout?.textAnchor?.textSegments || [];
-    const pageText = safeSliceBySegments(text, segs).trim();
-    return pageText;
-  });
-}
-
-/**
- * Always output PNG bytes for pages.
- * DocAI may return image/png or image/jpeg; we normalize to PNG.
- */
-async function toPngBytes(mimeType, contentBytes) {
-  const buf = Buffer.isBuffer(contentBytes) ? contentBytes : Buffer.from(contentBytes);
-  // If already PNG, keep
-  if ((mimeType || "").toLowerCase().includes("png")) return buf;
-  // Convert to PNG
-  return await sharp(buf).png().toBuffer();
-}
-
-/**
- * Simple, classical tag schema (replace later with Greimas SS).
- * We tag from PAGE TEXT for now (fast, stable, replaceable later with vision tagging).
- */
-function buildTaggingPrompt({ docHint, items }) {
-  // items: [{page, textExcerpt}]
-  return `
-You are an IP-BRAIN ingestion tagger.
-Task: For each page, produce compact JSON tags to help later image selection for domains/cards.
-
-Return STRICT JSON ONLY, no markdown.
-
-Document hint (high level): ${docHint}
-
-For each item, output:
-{
-  "page": number,
-  "tags": string[],
-  "entities": {
-    "characters": string[],
-    "locations": string[],
-    "factions": string[],
-    "objects": string[]
-  },
-  "domainAffinity": { "OVERVIEW": number, "CHARACTERS": number, "WORLD": number, "LORE": number, "STYLE": number, "STORY": number },
-  "isPosterCandidate": boolean,
-  "confidence": number
-}
-
-Rules:
-- tags must be short tokens (1–3 words), max 18 tags.
-- domainAffinity values 0..1 (floats).
-- Use "Unknown" strings only if truly empty, otherwise [].
-- Do NOT invent canon beyond the provided page excerpt.
-- isPosterCandidate true only if it likely contains key art, cover-like page, main cast, or emblematic world/lore symbol.
-
-Items:
-${JSON.stringify(items, null, 2)}
-`.trim();
-}
-
-async function tagPagesWithGemini({ pages }) {
-  const apiKey = opt("GEMINI_API_KEY");
-  if (!apiKey) {
-    // No Gemini: return empty tags (but ingestion still works)
-    return pages.map((p) => ({
-      page: p.page,
-      tags: [],
-      entities: { characters: [], locations: [], factions: [], objects: [] },
-      domainAffinity: { OVERVIEW: 0, CHARACTERS: 0, WORLD: 0, LORE: 0, STYLE: 0, STORY: 0 },
-      isPosterCandidate: false,
-      confidence: 0,
-      note: "GEMINI_API_KEY missing",
-    }));
-  }
-
-  const ai = new GoogleGenAI({ apiKey, vertexai: false });
-
-  // Build a small document hint from early pages
-  const hint = pages
-    .slice(0, 3)
-    .map((p) => p.textExcerpt)
-    .join("\n---\n")
-    .slice(0, 1500);
-
-  const out = [];
-  for (let i = 0; i < pages.length; i += TAG_BATCH_SIZE) {
-    const batch = pages.slice(i, i + TAG_BATCH_SIZE);
-
-    const prompt = buildTaggingPrompt({
-      docHint: hint || "Unknown",
-      items: batch.map((b) => ({
-        page: b.page,
-        textExcerpt: b.textExcerpt,
-      })),
-    });
-
-    const resp = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: { role: "user", parts: [{ text: prompt }] },
-      config: { temperature: 0.1 },
-    });
-
-    const text = String(resp?.text || "").trim();
-
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      throw new Error(
-        `Gemini tagger returned non-JSON. First 400 chars: ${text.slice(0, 400)}`
-      );
-    }
-
-    if (!Array.isArray(parsed)) {
-      throw new Error("Gemini tagger must return a JSON array (one item per page).");
-    }
-
-    out.push(...parsed);
-  }
-
-  // Normalize required fields
-  return out.map((x) => ({
-    page: Number(x?.page || 0),
-    tags: Array.isArray(x?.tags) ? x.tags.map(String) : [],
-    entities: {
-      characters: Array.isArray(x?.entities?.characters) ? x.entities.characters.map(String) : [],
-      locations: Array.isArray(x?.entities?.locations) ? x.entities.locations.map(String) : [],
-      factions: Array.isArray(x?.entities?.factions) ? x.entities.factions.map(String) : [],
-      objects: Array.isArray(x?.entities?.objects) ? x.entities.objects.map(String) : [],
-    },
-    domainAffinity: {
-      OVERVIEW: Number(x?.domainAffinity?.OVERVIEW ?? 0),
-      CHARACTERS: Number(x?.domainAffinity?.CHARACTERS ?? 0),
-      WORLD: Number(x?.domainAffinity?.WORLD ?? 0),
-      LORE: Number(x?.domainAffinity?.LORE ?? 0),
-      STYLE: Number(x?.domainAffinity?.STYLE ?? 0),
-      STORY: Number(x?.domainAffinity?.STORY ?? 0),
-    },
-    isPosterCandidate: Boolean(x?.isPosterCandidate),
-    confidence: Math.max(0, Math.min(1, Number(x?.confidence ?? 0))),
-  }));
-}
+// ---------- handler ----------
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-
   try {
-    const projectId = need("GCP_PROJECT_ID");
-    const location = need("DOCAI_LOCATION");
-    const processorId = need("DOCAI_PROCESSOR_ID");
-
-    const body = readJsonBody(req);
-    const blobUrl = body?.blobUrl;
-    const projectKey = String(body?.projectId || "default");
-
-    if (!blobUrl || typeof blobUrl !== "string") {
-      return res.status(400).json({ error: "Missing blobUrl" });
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "POST only" });
+      return;
     }
 
-    const client = makeDocAIClient();
+    const body = jsonBody(req);
+    const pdfBlobUrl = body?.blobUrl;
+    const projectId = cleanPrefixSegment(body?.projectId || "default");
 
-    // Fetch PDF bytes (already uploaded to Blob)
-    const r = await fetch(blobUrl);
+    if (!pdfBlobUrl || typeof pdfBlobUrl !== "string") {
+      res.status(400).json({ error: "Missing blobUrl" });
+      return;
+    }
+
+    const { projectFromKey } = ensureCreds();
+
+    const location = process.env.DOCAI_LOCATION || "us";
+    const processorId = process.env.DOCAI_PROCESSOR_ID;
+    if (!processorId) throw new Error("Missing env var: DOCAI_PROCESSOR_ID");
+
+    const project = pickProjectId(projectFromKey);
+    if (!project) throw new Error("Missing GCP project id (GCP_PROJECT_ID)");
+
+    // Deterministic ingestion id = same pdfBlobUrl -> same folder
+    const ingestionId = cleanPrefixSegment(body?.ingestionId || sha1(pdfBlobUrl));
+    const prefix = `projects/${projectId}/ingestions/${ingestionId}`;
+
+    // Fetch PDF bytes from Blob
+    const r = await fetch(pdfBlobUrl);
     if (!r.ok) {
-      return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+      res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+      return;
     }
-    const pdfBuf = Buffer.from(await r.arrayBuffer());
+    const pdfBytes = new Uint8Array(await r.arrayBuffer());
 
-    // Count pages
-    const src = await PDFDocument.load(pdfBuf);
-    const totalPages = src.getPageCount();
+    // Page count
+    const pdf = await PDFDocument.load(pdfBytes);
+    const pageCount = pdf.getPageCount();
 
-    // Ingestion id and blob prefix
-    const ingestionId = `ingest-${Date.now()}`;
-    const prefix = `otherly/${projectKey}/${ingestionId}`;
+    // Per-page outputs
+    const pages = [];
+    const tagsPages = [];
 
-    // Accumulators
-    const fullTextParts = [];
-    const pageImages = []; // {page, imageUrl, width, height}
-    const perPageText = []; // {page, text}
-    let imagesMissingCount = 0;
+    let fullTextParts = [];
 
-    // Single DocAI loop: text + page images + per-page text
-    for (let start = 0; start < totalPages; start += DOCAI_PAGES_PER_CALL) {
-      const end = Math.min(totalPages, start + DOCAI_PAGES_PER_CALL);
+    // Chunk through DocAI
+    let globalPageIndex = 0;
+    for (let start = 0; start < pageCount; start += DOCAI_MAX_PAGES_PER_CALL) {
+      const end = Math.min(pageCount, start + DOCAI_MAX_PAGES_PER_CALL);
+      const subPdfBytes = await makeSubPdf(pdfBytes, start, end);
 
-      const chunk = await PDFDocument.create();
-      const indices = Array.from({ length: end - start }, (_, i) => start + i);
-      const copied = await chunk.copyPages(src, indices);
-      copied.forEach((p) => chunk.addPage(p));
-      const chunkBytes = await chunk.save();
-
-      const doc = await docaiProcessPdfBytes({
-        client,
-        projectId,
+      const doc = await processDocAI({
+        project,
         location,
         processorId,
-        pdfBytes: chunkBytes,
+        pdfBuf: subPdfBytes,
       });
 
-      const chunkText = doc.text || "";
-      if (chunkText) fullTextParts.push(chunkText);
+      const fullText = doc?.text || "";
+      if (fullText) fullTextParts.push(fullText);
 
-      const pageTexts = getPerPageTextFromDoc(doc); // array aligned to pages in this chunk
-      const pages = doc.pages || [];
+      const docPages = doc?.pages || [];
+      for (let i = 0; i < docPages.length; i++) {
+        const pageNum1 = start + i + 1; // 1-based in final doc
+        const page = docPages[i];
 
-      for (let i = 0; i < pages.length; i++) {
-        const globalPage = start + 1 + i;
-
-        // ---- per-page text segment (segmentation + metatags base)
-        const t = (pageTexts[i] || "").trim();
-        perPageText.push({
-          page: globalPage,
-          text: t,
-          meta: {
-            charCount: t.length,
-            wordCount: t ? t.split(/\s+/).filter(Boolean).length : 0,
-          },
-        });
-
-        // ---- page image (raster) -> ALWAYS PNG -> Blob
-        const img = pages[i]?.image;
-        const content = img?.content;
-        const mimeType = img?.mimeType || "image/png";
-
-        if (!content) {
-          imagesMissingCount += 1;
-          continue;
+        // --- image (force PNG) ---
+        const raw = page?.image?.content;
+        let rawBuf = null;
+        if (raw) {
+          if (typeof raw === "string") rawBuf = Buffer.from(raw, "base64");
+          else rawBuf = Buffer.from(raw);
         }
 
-        const pngBytes = await toPngBytes(mimeType, content);
+        let imageUrl = null;
+        let width = 0;
+        let height = 0;
 
-        const key = `${prefix}/pages/page-${String(globalPage).padStart(3, "0")}.png`;
-        const blob = await put(key, pngBytes, {
+        if (rawBuf && rawBuf.length > 0) {
+          // convert to PNG ALWAYS
+          const pngBuf = await sharp(rawBuf).png().toBuffer();
+          const meta = await sharp(pngBuf).metadata();
+          width = Number(meta.width || 0);
+          height = Number(meta.height || 0);
+
+          const key = `${prefix}/pages/page-${String(pageNum1).padStart(3, "0")}.png`;
+          const putRes = await put(key, pngBuf, {
+            access: "public",
+            contentType: "image/png",
+          });
+
+          imageUrl = putRes.url;
+        }
+
+        // --- per-page text ---
+        const pageText =
+          extractFromTextAnchor(fullText, page?.layout?.textAnchor) || "";
+
+        const pageTextKey = `${prefix}/pages/page-${String(pageNum1).padStart(
+          3,
+          "0"
+        )}.txt`;
+        const pageTextPut = await put(pageTextKey, Buffer.from(pageText, "utf-8"), {
           access: "public",
-          contentType: "image/png",
+          contentType: "text/plain; charset=utf-8",
         });
 
-        pageImages.push({
-          page: globalPage,
-          imageUrl: blob.url,
-          width: Number(img?.width || 0),
-          height: Number(img?.height || 0),
+        // --- tags stub (replaceable later) ---
+        const keywords = simpleKeywords(pageText, 12);
+        tagsPages.push({ page: pageNum1, keywords });
+
+        pages.push({
+          page: pageNum1,
+          imageUrl,
+          width,
+          height,
+          pageTextUrl: pageTextPut.url,
         });
+
+        globalPageIndex++;
       }
     }
 
-    const fullText = fullTextParts.join("\n\n");
-
-    // Store fullText.txt
-    const textBlob = await put(`${prefix}/fullText.txt`, fullText, {
+    // store full text
+    const fullTextJoined = fullTextParts.join("\n\n").trim();
+    const fullTextKey = `${prefix}/fullText.txt`;
+    const fullTextPut = await put(fullTextKey, Buffer.from(fullTextJoined, "utf-8"), {
       access: "public",
       contentType: "text/plain; charset=utf-8",
     });
 
-    // Build tagging inputs (excerpt per page)
-    const tagInputs = perPageText.map((p) => ({
-      page: p.page,
-      textExcerpt: (p.text || "").slice(0, 1400), // keep small/fast
-    }));
-
-    // Tag pages (stored as tags.json)
-    const tags = await tagPagesWithGemini({ pages: tagInputs });
-
-    const tagsBlob = await put(`${prefix}/tags.json`, JSON.stringify({ tags }, null, 2), {
+    // store tags
+    const tagsObj = {
+      version: 1,
+      projectId,
+      ingestionId,
+      pdfBlobUrl,
+      pageCount,
+      pages: tagsPages,
+      note: "Simple keyword tags (placeholder). Swap later via Settings tab.",
+    };
+    const tagsKey = `${prefix}/tags.json`;
+    const tagsPut = await put(tagsKey, Buffer.from(JSON.stringify(tagsObj, null, 2)), {
       access: "public",
-      contentType: "application/json; charset=utf-8",
+      contentType: "application/json",
     });
 
-    // Manifest (single source of truth)
+    // store manifest (single source of truth)
     const manifest = {
-      ok: true,
+      version: 1,
+      projectId,
       ingestionId,
       createdAt: new Date().toISOString(),
-      pdfBlobUrl: blobUrl,
-      pageCount: totalPages,
-
-      // Stored assets
-      textUrl: textBlob.url,
-      tagsUrl: tagsBlob.url,
-
-      // In-memory mirrors (so client can show immediately)
-      fullText,
-      pageImages,
-      perPageText,
-
-      // counts
-      pageImagesCount: pageImages.length,
-      imagesMissingCount,
+      pdfBlobUrl,
+      pageCount,
+      fullTextUrl: fullTextPut.url,
+      tagsUrl: tagsPut.url,
+      pages,
     };
 
-    const manifestBlob = await put(`${prefix}/manifest.json`, JSON.stringify(manifest, null, 2), {
-      access: "public",
-      contentType: "application/json; charset=utf-8",
-    });
+    const manifestKey = `${prefix}/manifest.json`;
+    const manifestPut = await put(
+      manifestKey,
+      Buffer.from(JSON.stringify(manifest, null, 2)),
+      { access: "public", contentType: "application/json" }
+    );
 
-    // IMPORTANT: respond in the shape your client helper already expects
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
-      pdfBlobUrl: blobUrl,
+      projectId,
       ingestionId,
-      pageCount: totalPages,
-      fullText,
-      pageImages,
-      textUrl: textBlob.url,
-      tagsUrl: tagsBlob.url,
-      manifestUrl: manifestBlob.url,
-      imagesMissingCount,
+      prefix,
+      pdfBlobUrl,
+      pageCount,
+      manifestUrl: manifestPut.url,
+      fullTextUrl: fullTextPut.url,
+      tagsUrl: tagsPut.url,
+      pageImagesCount: pages.filter((p) => !!p.imageUrl).length,
+      pages,
     });
   } catch (e) {
-    console.error("pdf-ingest error:", e);
-    return res.status(500).json({ error: e?.message || String(e) });
+    res.status(500).json({ error: e?.message || String(e) });
   }
 }
