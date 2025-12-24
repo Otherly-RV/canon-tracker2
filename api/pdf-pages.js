@@ -1,19 +1,18 @@
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
+// ✅ Hard-disable worker (prevents Vercel from trying to import pdf.worker.mjs)
+pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+
 export const config = { maxDuration: 300 };
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "POST only" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
     const body =
       typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
 
     const blobUrl = body?.blobUrl;
-
-    // Optional: limit pages to extract text from (useful for huge PDFs)
     const maxPagesText =
       typeof body?.maxPagesText === "number" ? body.maxPagesText : null;
 
@@ -21,26 +20,22 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing blobUrl" });
     }
 
-    // 1) Fetch PDF bytes
     const r = await fetch(blobUrl);
-    if (!r.ok) {
-      return res
-        .status(400)
-        .json({ error: `Could not fetch blobUrl (${r.status})` });
-    }
+    if (!r.ok) return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+
     const bytes = new Uint8Array(await r.arrayBuffer());
 
-    // 2) Load PDF (server-safe)
     const loadingTask = pdfjsLib.getDocument({
       data: bytes,
+      // ✅ these two are what matters on Vercel
       disableWorker: true,
+      worker: null,
       useSystemFonts: true,
     });
 
     const pdf = await loadingTask.promise;
     const pageCount = pdf.numPages;
 
-    // 3) Extract full text (no images here)
     const lastPage =
       maxPagesText && Number.isFinite(maxPagesText)
         ? Math.min(pageCount, Math.max(1, Math.floor(maxPagesText)))
@@ -60,12 +55,10 @@ export default async function handler(req, res) {
       if (pageText) parts.push(pageText);
     }
 
-    const fullText = parts.join("\n\n");
-
     return res.status(200).json({
       ok: true,
       pageCount,
-      fullText,
+      fullText: parts.join("\n\n"),
       pageImages: [],
       pagesWithImages: 0,
     });
