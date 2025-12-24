@@ -1,15 +1,8 @@
-// api/pdf-render.js
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
+// api/pdf-pages.js
 import { v1 as documentai } from "@google-cloud/documentai";
 import { PDFDocument } from "pdf-lib";
-import { put } from "@vercel/blob";
 
 export const config = { maxDuration: 300 };
-
-// Chunk size (internal). Still returns ALL images in one response.
 const DOCAI_PAGES_PER_CALL = 15;
 
 function need(name) {
@@ -29,28 +22,37 @@ function readJsonBody(req) {
   return req.body ?? {};
 }
 
-function writeCredsToTmpFromB64() {
-  const b64 = need("GCP_SA_KEY_JSON_B64");
-  const json = Buffer.from(b64, "base64").toString("utf8");
+function getServiceAccountFromEnv() {
+  // This is still "using env vars"; we are not writing any raw string anywhere.
+  const raw = need("GCP_SA_KEY_JSON");
 
-  const p = path.join(os.tmpdir(), "gcp-sa.json");
-  fs.writeFileSync(p, json, "utf8");
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = p;
+  // Vercel sometimes stores the private_key newlines as "\n" (escaped)
+  // or as literal newlines. This makes JSON.parse stable.
+  const fixed = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
+
+  try {
+    return JSON.parse(fixed);
+  } catch (e) {
+    throw new Error(
+      `GCP_SA_KEY_JSON is not valid JSON. Re-save it in Vercel as a single JSON object string. Parse error: ${e?.message || e}`
+    );
+  }
 }
 
-function mimeToExt(mimeType) {
-  const m = (mimeType || "").toLowerCase();
-  if (m.includes("png")) return "png";
-  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
-  if (m.includes("webp")) return "webp";
-  return "png";
-}
+function makeDocAIClient() {
+  const sa = getServiceAccountFromEnv();
+  const location = need("DOCAI_LOCATION");
 
-async function docaiProcessPdfBytes({ projectId, location, processorId, pdfBytes }) {
-  const client = new documentai.DocumentProcessorServiceClient({
+  return new documentai.DocumentProcessorServiceClient({
     apiEndpoint: `${location}-documentai.googleapis.com`,
+    credentials: {
+      client_email: sa.client_email,
+      private_key: sa.private_key,
+    },
   });
+}
 
+async function docaiProcessPdfBytes({ client, projectId, location, processorId, pdfBytes }) {
   const name = `projects/${projectId}/locations/${location}/processors/${processorId}`;
 
   const [result] = await client.processDocument({
@@ -70,36 +72,30 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
-    writeCredsToTmpFromB64();
-
     const projectId = need("GCP_PROJECT_ID");
     const location = need("DOCAI_LOCATION");
     const processorId = need("DOCAI_PROCESSOR_ID");
 
-    const body = readJsonBody(req);
+    const client = makeDocAIClient();
 
+    const body = readJsonBody(req);
     const blobUrl = body?.blobUrl;
-    const prefix = body?.prefix || `docai-pages/${Date.now()}`;
 
     if (!blobUrl || typeof blobUrl !== "string") {
       return res.status(400).json({ error: "Missing blobUrl" });
     }
 
-    // 1) Download PDF
     const r = await fetch(blobUrl);
     if (!r.ok) {
       return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
     }
     const pdfBuf = Buffer.from(await r.arrayBuffer());
 
-    // 2) Total pages
     const src = await PDFDocument.load(pdfBuf);
     const totalPages = src.getPageCount();
 
-    const pageImages = [];
-    let imagesMissingCount = 0;
+    const textParts = [];
 
-    // 3) Chunk internally; still returns ALL images
     for (let start = 0; start < totalPages; start += DOCAI_PAGES_PER_CALL) {
       const end = Math.min(totalPages, start + DOCAI_PAGES_PER_CALL);
 
@@ -110,54 +106,23 @@ export default async function handler(req, res) {
       const chunkBytes = await chunk.save();
 
       const doc = await docaiProcessPdfBytes({
+        client,
         projectId,
         location,
         processorId,
         pdfBytes: chunkBytes,
       });
 
-      const pages = doc.pages || [];
-
-      for (let i = 0; i < pages.length; i++) {
-        const globalPage = start + 1 + i; // 1-indexed
-
-        const img = pages[i]?.image;
-        const content = img?.content;
-        const mimeType = img?.mimeType || "image/png";
-
-        if (!content) {
-          imagesMissingCount += 1;
-          continue;
-        }
-
-        const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
-        const ext = mimeToExt(mimeType);
-
-        const key = `${prefix}/page-${String(globalPage).padStart(3, "0")}.${ext}`;
-        const blob = await put(key, bytes, {
-          access: "public",
-          contentType: mimeType,
-        });
-
-        pageImages.push({
-          page: globalPage,
-          imageUrl: blob.url,
-          width: img?.width || 0,
-          height: img?.height || 0,
-          source: "docai",
-        });
-      }
+      if (doc.text) textParts.push(doc.text);
     }
 
     return res.status(200).json({
       ok: true,
       pageCount: totalPages,
-      pageImages,
-      hasPageImages: pageImages.length > 0,
-      imagesMissingCount,
+      fullText: textParts.join("\n\n"),
     });
   } catch (e) {
-    console.error("pdf-render error:", e);
+    console.error("pdf-pages error:", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 }
