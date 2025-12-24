@@ -1,18 +1,29 @@
 // api/pdf-render.js
-import { createRequire } from "module";
 import { createCanvas } from "@napi-rs/canvas";
 import { put } from "@vercel/blob";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 export const config = { maxDuration: 300 };
 
-// Load pdfjs in a Vercel-friendly way (CJS build)
-const require = createRequire(import.meta.url);
-const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js");
+// Resolve worker URL in a way that works in Node/Vercel
+const WORKER_CANDIDATES = [
+  "pdfjs-dist/legacy/build/pdf.worker.mjs",
+  "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
+  "pdfjs-dist/build/pdf.worker.mjs",
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+];
 
-// ✅ Required to avoid "No GlobalWorkerOptions.workerSrc specified"
-pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve(
-  "pdfjs-dist/legacy/build/pdf.worker.js"
-);
+let resolvedWorkerSrc = null;
+for (const spec of WORKER_CANDIDATES) {
+  try {
+    resolvedWorkerSrc = import.meta.resolve(spec);
+    break;
+  } catch {}
+}
+
+if (resolvedWorkerSrc) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = resolvedWorkerSrc;
+}
 
 function clampInt(n, min, max) {
   const x = Number(n);
@@ -24,6 +35,13 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
+    if (!resolvedWorkerSrc) {
+      return res.status(500).json({
+        error:
+          'pdfjs worker not found. Tried: ' + WORKER_CANDIDATES.join(", "),
+      });
+    }
+
     const body =
       typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
 
@@ -38,11 +56,11 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing blobUrl" });
     }
 
-    // Fetch PDF bytes
     const r = await fetch(blobUrl);
     if (!r.ok) {
       return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
     }
+
     const bytes = new Uint8Array(await r.arrayBuffer());
 
     const loadingTask = pdfjsLib.getDocument({
@@ -94,6 +112,7 @@ export default async function handler(req, res) {
       endPage,
       pagesRendered: pageImages.length,
       pageImages,
+      workerSrc: resolvedWorkerSrc,
     });
   } catch (e) {
     console.error("pdf-render error:", e);
