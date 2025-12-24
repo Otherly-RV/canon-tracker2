@@ -101,11 +101,5 @@ export function CompletenessProvider({ children }: { children: ReactNode }) {
 ----------------------------- */
 
 export function useCompleteness() {
-  const ctx = useContext(CompletenessContext);
-  if (!ctx) {
-    throw new Error(
-      "useCompleteness must be used within a CompletenessProvider"
-    );
-  }
-  return ctx;
+  return useContext(CompletenessContext) as any;
 }
