@@ -1,134 +1,72 @@
 import React, { useEffect, useMemo } from "react";
 import { useCompleteness } from "../context/CompletenessContext";
 
-type Props = {
-  path: string;
-  label: string;
-};
-
-function isProbablyImageUrl(v: string): boolean {
-  if (!v) return false;
-
-  // Accept common URL schemes and Vercel Blob URLs
-  if (v.startsWith("http://") || v.startsWith("https://")) return true;
-  if (v.startsWith("data:image/")) return true;
-  if (v.startsWith("blob:")) return true;
-
-  return false;
+function isLikelyUrl(s: string) {
+  return /^https?:\/\/.+/i.test((s || "").trim()) || (s || "").startsWith("data:image/");
 }
 
-function truncate(s: string, max = 220): string {
-  const t = s.trim();
-  if (t.length <= max) return t;
-  return t.slice(0, max) + "…";
-}
-
-export default function ImageFieldSlot({ path, label }: Props) {
+export default function ImageFieldSlot({ label, path }: { label: string; path: string }) {
   const { fieldContents, updateFieldContent, pdfPageImages } = useCompleteness();
 
-  const rawValue = useMemo(() => {
-    const v = fieldContents.get(path);
-    if (v === undefined || v === null) return "";
-    return String(v);
-  }, [fieldContents, path]);
-
-  const imageUrl = useMemo(() => {
-    return isProbablyImageUrl(rawValue) ? rawValue : "";
-  }, [rawValue]);
-
-  // If the value isn't a URL, treat it as prompt-ish text (and don't break <img>)
-  const promptText = useMemo(() => {
-    return !isProbablyImageUrl(rawValue) && rawValue.trim() ? rawValue : "";
-  }, [rawValue]);
-
-  const isEmptyImage = !imageUrl || imageUrl === "Unknown";
-
-  const canAutofill =
-    Array.isArray(pdfPageImages) &&
-    pdfPageImages.length > 0 &&
-    typeof pdfPageImages[0]?.imageUrl === "string" &&
-    pdfPageImages[0].imageUrl.length > 0;
+  const value = useMemo(() => fieldContents.get(path) ?? "", [fieldContents, path]);
+  const url = isLikelyUrl(value) ? value : "";
 
   const isKeyArtPoster = path.endsWith(".KeyArtPoster");
+  const page1Url = pdfPageImages?.[0]?.url || ""; // ✅ IMPORTANT: your type uses .url
 
-  function autofillFromPdfPage1() {
-    if (!canAutofill) return;
-    updateFieldContent(path, pdfPageImages[0].imageUrl);
-  }
-
-  function clearField() {
-    updateFieldContent(path, "");
-  }
-
-  // ✅ Auto-fill KeyArtPoster (no user picking) if empty/invalid
+  // ✅ Auto-assign KeyArtPoster to page 1 if empty/bad
   useEffect(() => {
     if (!isKeyArtPoster) return;
-    if (!canAutofill) return;
-
-    // If the field currently contains non-url text or empty, replace with page 1 image
-    if (isEmptyImage) {
-      autofillFromPdfPage1();
-    }
-  }, [isKeyArtPoster, canAutofill, isEmptyImage]); // intentionally minimal deps
+    if (!page1Url) return;
+    if (url) return; // already a valid URL
+    updateFieldContent(path, page1Url);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isKeyArtPoster, page1Url]);
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="text-sm font-semibold text-slate-200">{label}</div>
-          <div className="mt-1 text-xs text-slate-400">{path}</div>
-        </div>
+    <div className="flex flex-col gap-1.5">
+      <div className="text-sm font-medium text-slate-400">{label}</div>
 
-        <div className="flex gap-2">
-          {!isEmptyImage ? (
-            <button
-              className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 text-xs hover:bg-white/5"
-              onClick={clearField}
-              title="Clear this image"
-            >
-              Clear
-            </button>
-          ) : null}
-
-          {/* Keep this for non-KeyArtPoster image fields; KeyArtPoster auto-fills */}
-          {!isKeyArtPoster && canAutofill && isEmptyImage ? (
-            <button
-              className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 text-xs hover:bg-white/5"
-              onClick={autofillFromPdfPage1}
-              title="Auto-fill from PDF page 1"
-            >
-              Auto-fill
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="mt-3">
-        {isEmptyImage ? (
-          <div className="text-sm text-slate-400">
-            {canAutofill
-              ? "Waiting for PDF image… (KeyArtPoster will auto-fill from page 1)."
-              : "Upload a PDF first so we can extract page images."}
+      <div className="rounded-md border border-slate-700 bg-slate-800/60 p-3">
+        {url ? (
+          <div className="rounded-md overflow-hidden border border-slate-700 bg-slate-900/40">
+            <img src={url} className="w-full h-44 object-cover block" />
           </div>
         ) : (
-          <img
-            src={imageUrl}
-            alt={label}
-            className="w-full max-h-[360px] object-contain rounded-md border border-slate-700 bg-black/20"
-          />
+          <div className="text-slate-500 italic text-sm">
+            No image assigned yet.{" "}
+            {isKeyArtPoster
+              ? page1Url
+                ? "KeyArtPoster will auto-fill from PDF page 1."
+                : "Upload a PDF first."
+              : "Upload a PDF first."}
+          </div>
         )}
 
-        {/* If this field currently contains text (prompt), show it as text, not as <img src>. */}
-        {promptText ? (
-          <div className="mt-3 rounded-md border border-slate-700 bg-black/20 p-3">
-            <div className="text-xs font-semibold text-slate-300 mb-1">
-              Detected text in an image field (will NOT be used as an image URL)
-            </div>
-            <div className="text-xs text-slate-400 whitespace-pre-wrap">
-              {truncate(promptText, 140)}
-            </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {!isKeyArtPoster && page1Url && !url ? (
+            <button
+              onClick={() => updateFieldContent(path, page1Url)}
+              className="px-3 py-2 rounded-md bg-slate-700 text-slate-200 hover:bg-slate-600 text-sm"
+            >
+              Auto-fill (Page 1)
+            </button>
+          ) : null}
+
+          <button
+            onClick={() => updateFieldContent(path, "")}
+            className="px-3 py-2 rounded-md bg-slate-700 text-slate-200 hover:bg-slate-600 text-sm"
+          >
+            Clear
+          </button>
+        </div>
+
+        {/* Keep prompt/description text if user/generator put text here */}
+        {!url && value?.trim() && (
+          <div className="mt-3 text-xs text-slate-300 whitespace-pre-wrap border border-slate-700 rounded-md p-3 bg-slate-900/40">
+            {value}
           </div>
-        ) : null}
+        )}
       </div>
     </div>
   );
