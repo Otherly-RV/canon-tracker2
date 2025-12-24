@@ -1,97 +1,108 @@
 // api/pdf-pages.js
+import { put } from "@vercel/blob";
+import { createCanvas } from "@napi-rs/canvas";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+// ✅ Force Vercel to include the worker file in the serverless bundle
+import "pdfjs-dist/legacy/build/pdf.worker.mjs";
 
 export const config = { maxDuration: 300 };
 
-// Resolve worker URL in a way that works in Node/Vercel
-const WORKER_CANDIDATES = [
-  "pdfjs-dist/legacy/build/pdf.worker.mjs",
-  "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
-  "pdfjs-dist/build/pdf.worker.mjs",
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-];
+// ✅ Point pdf.js fake worker at a REAL file URL inside the serverless bundle
+const require = createRequire(import.meta.url);
+pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(
+  require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")
+).toString();
 
-let resolvedWorkerSrc = null;
-for (const spec of WORKER_CANDIDATES) {
-  try {
-    // Node 20+: import.meta.resolve returns a URL string (e.g. file:///var/task/...)
-    resolvedWorkerSrc = import.meta.resolve(spec);
-    break;
-  } catch {}
-}
-
-if (resolvedWorkerSrc) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = resolvedWorkerSrc;
+function readJsonBody(req) {
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body || "{}");
+    } catch {
+      return {};
+    }
+  }
+  return req.body ?? {};
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-
   try {
-    if (!resolvedWorkerSrc) {
-      return res.status(500).json({
-        error:
-          'pdfjs worker not found. Tried: ' + WORKER_CANDIDATES.join(", "),
-      });
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "POST only" });
+      return;
     }
 
-    const body =
-      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
-
+    const body = readJsonBody(req);
     const blobUrl = body?.blobUrl;
-    const maxPagesText =
-      typeof body?.maxPagesText === "number" ? body.maxPagesText : null;
+    const prefix = body?.prefix || `pdf-pages/${Date.now()}`;
+    const scale = typeof body?.scale === "number" ? body.scale : 1.5; // 1.0–2.0 typical
 
     if (!blobUrl || typeof blobUrl !== "string") {
-      return res.status(400).json({ error: "Missing blobUrl" });
+      res.status(400).json({ error: "Missing blobUrl" });
+      return;
     }
 
+    // 1) Fetch PDF bytes (from Vercel Blob URL)
     const r = await fetch(blobUrl);
     if (!r.ok) {
-      return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+      res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+      return;
     }
 
-    const bytes = new Uint8Array(await r.arrayBuffer());
+    const pdfBytes = new Uint8Array(await r.arrayBuffer());
 
+    // 2) Load PDF via pdf.js (Node) and render each page to PNG
     const loadingTask = pdfjsLib.getDocument({
-      data: bytes,
-      // You can keep workers enabled now that workerSrc is set
-      disableWorker: false,
-      useSystemFonts: true,
+      data: pdfBytes,
+      // ✅ Avoid worker_threads in serverless, use "fake worker" (needs workerSrc set)
+      disableWorker: true,
     });
 
     const pdf = await loadingTask.promise;
     const pageCount = pdf.numPages;
 
-    const lastPage =
-      maxPagesText && Number.isFinite(maxPagesText)
-        ? Math.min(pageCount, Math.max(1, Math.floor(maxPagesText)))
-        : pageCount;
+    const pageImages = [];
 
-    const parts = [];
+    for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale });
 
-    for (let i = 1; i <= lastPage; i++) {
-      const page = await pdf.getPage(i);
-      const tc = await page.getTextContent();
-      const pageText = (tc.items || [])
-        .map((it) => (it && it.str ? String(it.str) : ""))
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
+      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+      const ctx = canvas.getContext("2d");
 
-      if (pageText) parts.push(pageText);
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport,
+      });
+
+      await renderTask.promise;
+
+      const pngBuf = canvas.toBuffer("image/png");
+
+      const key = `${prefix}/page-${String(pageNum).padStart(3, "0")}.png`;
+      const blob = await put(key, pngBuf, {
+        access: "public",
+        contentType: "image/png",
+      });
+
+      pageImages.push({
+        page: pageNum,
+        imageUrl: blob.url,
+        width: Math.ceil(viewport.width),
+        height: Math.ceil(viewport.height),
+      });
     }
 
-    return res.status(200).json({
+    await loadingTask.destroy();
+
+    res.status(200).json({
       ok: true,
       pageCount,
-      fullText: parts.join("\n\n"),
-      pageImages: [],
-      pagesWithImages: 0,
-      workerSrc: resolvedWorkerSrc,
+      pageImages,
     });
   } catch (e) {
-    console.error("pdf-pages error:", e);
-    return res.status(500).json({ error: e?.message || String(e) });
+    res.status(500).json({ error: e?.message || String(e) });
   }
 }
