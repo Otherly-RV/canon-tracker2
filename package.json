@@ -21,6 +21,7 @@
     "@vercel/blob": "^0.25.0",
     "google-auth-library": "^9.14.0",
     "pdf-lib": "^1.17.1",
+    "@napi-rs/canvas": "^0.1.86",
     "sharp": "^0.34.0"
   },
   "devDependencies": {
