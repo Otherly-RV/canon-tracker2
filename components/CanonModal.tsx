@@ -1,182 +1,148 @@
-import React, { useEffect, useRef, useState } from "react"
-import { motion, AnimatePresence } from "framer-motion"
-import { Upload, Save, X } from "lucide-react"
-import { useCompleteness } from "../context/CompletenessContext"
-import { extractTextFromFile } from "../utils/fileReader"
-import { uploadPdfAndExtractPages } from "../utils/uploadPdfAndExtractPages"
-
-const Editor: React.FC<{
-  value: string
-  onChange: (val: string) => void
-  placeholder?: string
-}> = ({ value, onChange, placeholder }) => (
-  <textarea
-    value={value}
-    onChange={(e) => onChange(e.target.value)}
-    placeholder={placeholder}
-    className="w-full h-[55vh] bg-slate-900/60 border border-slate-700 rounded-lg p-4 text-slate-200 placeholder-slate-500 focus:ring-2 focus:ring-sky-500 focus:outline-none resize-none font-mono text-sm"
-  />
-)
+import React, { useRef, useState } from "react";
+import { useCompleteness } from "../context/CompletenessContext";
+import { pdfIngestFromBlob, uploadPdfToBlob } from "../src/utils/pdfIngest";
 
 type Props = {
-  isOpen: boolean
-  onClose: () => void
-}
+  isOpen: boolean;
+  onClose: () => void;
+};
 
-function isPdf(file: File) {
-  const n = (file.name || "").toLowerCase()
-  return file.type === "application/pdf" || n.endsWith(".pdf")
-}
+export default function CanonModal({ isOpen, onClose }: Props) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-const CanonModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const {
-    canonText,
+    setPdfBlobUrl,
+    setPdfPageImages,
+    setPdfManifestUrl,
     setCanonText,
     setExtractedContent,
     setIsViewerVisible,
-    setPdfBlobUrl,
-    setPdfPageImages,
-  } = useCompleteness()
+  } = useCompleteness();
 
-  const [localCanon, setLocalCanon] = useState("")
-  const [status, setStatus] = useState<string | null>(null)
-  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  if (!isOpen) return null;
 
-  useEffect(() => {
-    if (!isOpen) return
-    setLocalCanon(canonText || "")
-    setStatus(null)
-    setErr(null)
-  }, [isOpen, canonText])
+  async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (!f) return;
 
-  const onUploadClick = () => fileInputRef.current?.click()
-
-  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-
-    setErr(null)
-    setStatus("Uploading + extracting…")
+    setBusy(true);
+    setStatus("Uploading PDF to Blob…");
 
     try {
-      if (isPdf(file)) {
-        // ✅ SERVER PIPELINE (DocAI): blob upload + fullText + page images
-        const out = await uploadPdfAndExtractPages(file, "default")
+      // 1) upload PDF (only)
+      const pdfBlobUrl = await uploadPdfToBlob(f);
 
-        setPdfBlobUrl(out.pdfBlobUrl)
-        setPdfPageImages(out.pageImages)
+      setStatus("Ingesting with DocAI (text + PNG pages + tags)…");
 
-        setExtractedContent({ content: out.fullText || "", format: "text" })
-        setLocalCanon(out.fullText || "")
-        setIsViewerVisible(true)
+      // 2) ingest on server (DocAI + PNG conversion + tags + manifest)
+      const ingest = await pdfIngestFromBlob({
+        blobUrl: pdfBlobUrl,
+        projectId: "default",
+      });
 
-        setStatus(`Extracted: ${out.pageImages.length} page images, text length ${out.fullText?.length ?? 0}. Review and Save.`)
-      } else {
-        // DOCX path stays client-side (mammoth) — fine
-        const extracted = await extractTextFromFile(file)
-        setExtractedContent(extracted)
-        setLocalCanon(extracted.content)
-        setIsViewerVisible(true)
-        setStatus("Extracted. Review and Save.")
-      }
-    } catch (ex: any) {
-      setStatus(null)
-      setErr(ex?.message || "Failed to extract document.")
+      setPdfBlobUrl(ingest.pdfBlobUrl);
+      setPdfManifestUrl(ingest.manifestUrl);
+
+      // IMPORTANT: keep images in memory for now (Process step will select later)
+      // Map to your app’s PdfPageImage type (it expects {page,url,width,height})
+      setPdfPageImages(
+        ingest.pages
+          .filter((p) => !!p.imageUrl)
+          .map((p) => ({
+            page: p.page,
+            url: p.imageUrl as string,
+            width: p.width,
+            height: p.height,
+          }))
+      );
+
+      // 3) fetch full text (so UI shows text immediately)
+      const textResp = await fetch(ingest.fullTextUrl);
+      const fullText = textResp.ok ? await textResp.text() : "";
+
+      setCanonText(fullText);
+      setExtractedContent({ content: fullText, format: "text" });
+      setIsViewerVisible(true);
+
+      setStatus(`✅ Ingest done: ${ingest.pageCount} pages, ${ingest.pageImagesCount} PNG images`);
+    } catch (err: any) {
+      setStatus(`❌ ${err?.message || String(err)}`);
     } finally {
-      e.target.value = ""
+      setBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
-  const onSave = () => {
-    setCanonText(localCanon)
-    setStatus("Saved.")
-    setTimeout(() => setStatus(null), 1200)
-  }
-
   return (
-    <AnimatePresence>
-      {isOpen && (
-        <motion.div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) onClose()
-          }}
-        >
-          <motion.div
-            className="w-full max-w-5xl bg-slate-950 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden"
-            initial={{ y: 24, opacity: 0, scale: 0.98 }}
-            animate={{ y: 0, opacity: 1, scale: 1 }}
-            exit={{ y: 24, opacity: 0, scale: 0.98 }}
-            transition={{ type: "spring", stiffness: 260, damping: 22 }}
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.5)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 1000,
+      }}
+    >
+      <div
+        style={{
+          width: 720,
+          maxWidth: "92vw",
+          background: "#0b1220",
+          border: "1px solid rgba(255,255,255,0.12)",
+          borderRadius: 14,
+          padding: 18,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+          <div style={{ fontSize: 18, fontWeight: 700 }}>Ingest PDF</div>
+          <button
+            onClick={onClose}
+            style={{
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,0.2)",
+              borderRadius: 10,
+              padding: "6px 10px",
+              color: "white",
+              cursor: "pointer",
+            }}
           >
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
-              <div>
-                <div className="text-slate-100 font-semibold">Canon</div>
-                <div className="text-xs text-slate-400">
-                  Paste text or upload PDF/DOCX. Saving persists across sessions.
-                </div>
-              </div>
+            Close
+          </button>
+        </div>
 
-              <div className="flex items-center gap-2">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                  onChange={onFileChange}
-                  className="hidden"
-                />
-                <button
-                  onClick={onUploadClick}
-                  className="flex items-center gap-2 px-3 py-2 rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700 transition-colors"
-                >
-                  <Upload size={16} />
-                  Upload
-                </button>
-                <button
-                  onClick={onSave}
-                  className="flex items-center gap-2 px-3 py-2 rounded-md bg-emerald-600 text-white hover:bg-emerald-500 transition-colors"
-                >
-                  <Save size={16} />
-                  Save
-                </button>
-                <button
-                  onClick={onClose}
-                  className="p-2 rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700 transition-colors"
-                  aria-label="Close"
-                >
-                  <X size={18} />
-                </button>
-              </div>
-            </div>
+        <div style={{ marginTop: 14, opacity: 0.9, lineHeight: 1.35 }}>
+          This step does ONLY ingest:
+          <br />
+          1) Upload PDF to Blob
+          <br />
+          2) DocAI extract full text + page images → stored as <b>PNG only</b>
+          <br />
+          3) Create tags + manifest in Blob
+        </div>
 
-            <div className="px-6 py-4">
-              {err && (
-                <div className="mb-3 text-sm text-red-300 bg-red-950/40 border border-red-900/50 rounded-md p-3">
-                  {err}
-                </div>
-              )}
-              {status && (
-                <div className="mb-3 text-sm text-sky-200 bg-sky-950/30 border border-sky-900/40 rounded-md p-3">
-                  {status}
-                </div>
-              )}
+        <div style={{ marginTop: 14 }}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf"
+            disabled={busy}
+            onChange={onPickFile}
+            style={{ width: "100%" }}
+          />
+        </div>
 
-              <Editor
-                value={localCanon}
-                onChange={setLocalCanon}
-                placeholder="Paste your canon text here, or upload a PDF/DOCX."
-              />
-            </div>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
-  )
+        {status && (
+          <div style={{ marginTop: 12, fontSize: 13, opacity: 0.9 }}>
+            {busy ? "⏳ " : ""}
+            {status}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
-
-export default CanonModal
