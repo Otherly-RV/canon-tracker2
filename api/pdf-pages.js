@@ -109,34 +109,6 @@ export default async function handler(req, res) {
 
       if (doc.text) textParts.push(doc.text);
 
-      const pages = doc.pages || [];
-      for (let i = 0; i < pages.length; i++) {
-        globalPage += 1;
-
-        const img = pages[i]?.image;
-        if (!img?.content) continue;
-
-        // Document AI may provide a mimeType on the image; if not, assume png.
-        const mimeType = img?.mimeType || "image/png";
-        const ext = mimeToExt(mimeType);
-
-        const raw = Buffer.isBuffer(img.content) ? img.content : Buffer.from(img.content);
-
-        const key = `${prefix}/page-${String(globalPage).padStart(3, "0")}.${ext}`;
-        const blob = await put(key, raw, {
-          access: "public",
-          contentType: mimeType,
-        });
-
-        pageImages.push({
-          page: globalPage,
-          imageUrl: blob.url,
-          width: 0,
-          height: 0,
-        });
-      }
-    }
-
     res.status(200).json({
       ok: true,
       fullText: textParts.join("\n\n"),
