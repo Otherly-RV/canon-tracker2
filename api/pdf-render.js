@@ -11,10 +11,14 @@ function clampInt(n, min, max) {
 }
 
 export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "POST only" });
+  }
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body ?? {});
+  try {
+    const body =
+      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
+
     const blobUrl = body?.blobUrl;
     const prefix = body?.prefix || `pdf-render/${Date.now()}`;
     const scale = Number(body?.scale ?? 1.25);
@@ -28,10 +32,12 @@ export default async function handler(req, res) {
 
     // 1) Download PDF bytes
     const r = await fetch(blobUrl);
-    if (!r.ok) return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+    if (!r.ok) {
+      return res.status(400).json({ error: `Could not fetch blobUrl (${r.status})` });
+    }
     const bytes = new Uint8Array(await r.arrayBuffer());
 
-    // 2) Load PDF via pdfjs (disable workers in server env)
+    // 2) Load PDF (server-safe)
     const loadingTask = pdfjsLib.getDocument({
       data: bytes,
       disableWorker: true,
@@ -46,12 +52,15 @@ export default async function handler(req, res) {
 
     const pageImages = [];
 
-    // 3) Render requested page range to PNG + upload to Blob
+    // 3) Render to PNG + upload to Blob
     for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const viewport = page.getViewport({ scale });
 
-      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+      const canvas = createCanvas(
+        Math.ceil(viewport.width),
+        Math.ceil(viewport.height)
+      );
       const ctx = canvas.getContext("2d");
 
       await page.render({ canvasContext: ctx, viewport }).promise;
@@ -81,6 +90,7 @@ export default async function handler(req, res) {
       pageImages,
     });
   } catch (e) {
+    console.error("pdf-render error:", e);
     return res.status(500).json({ error: e?.message || String(e) });
   }
 }
