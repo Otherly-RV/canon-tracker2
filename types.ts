@@ -1,4 +1,4 @@
-import { ChecklistNode, ChecklistLeaf } from "./data/rules.ts";
+import { ChecklistNode, ChecklistLeaf } from "./data/rules";
 
 export type Level = "L1" | "L2" | "L3";
 export type Domain = "OVERVIEW" | "CHARACTERS" | "WORLD" | "LORE" | "STYLE" | "STORY";
@@ -32,29 +32,29 @@ export interface CompletenessContextType {
   resetCompleteness: () => void;
   getCompletenessForPath: (path: string) => CompletenessResult;
 
-  // Dynamic entity and checklist management
   identifiedEntities: IdentifiedEntities;
   setIdentifiedEntities: (entities: IdentifiedEntities) => void;
   allItems: string[];
   generateAllItems: (entities: IdentifiedEntities) => void;
 
-  // Canon and Rules Management
   canonText: string;
   setCanonText: (text: string) => void;
+
   execContractText: string;
   setExecContractText: (text: string) => void;
+
   fieldRules: any;
   setFieldRules: (rules: any) => void;
 
-  // PDF assets (extracted page images from DocAI)
+  // PDF assets
   pdfBlobUrl: string | null;
   setPdfBlobUrl: (url: string | null) => void;
   pdfPageImages: PdfPageImage[];
   setPdfPageImages: (imgs: PdfPageImage[]) => void;
 
-  // Canon Viewer
   extractedContent: ExtractedContent | null;
   setExtractedContent: (content: ExtractedContent | null) => void;
+
   isViewerVisible: boolean;
   setIsViewerVisible: (visible: boolean) => void;
 }
